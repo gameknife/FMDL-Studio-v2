@@ -37,6 +37,8 @@ sysinfo.txt
 # Standalone converter source project
 !tools/FmdlGltfConverter/FmdlGltfConverter.csproj
 tools/FmdlGltfConverter/bin/
+!tools/Fox2SceneConverter/Fox2SceneConverter.csproj
+tools/Fox2SceneConverter/bin/
 
 ###
 # OS generated
