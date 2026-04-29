@@ -14,7 +14,7 @@ internal sealed class GltfExporter
         WriteIndented = true,
     };
 
-    public void Export(FmdlFile fmdl, string outputPath, FoxHashLookup hashLookup)
+    public void Export(FmdlFile fmdl, string sourceModelPath, string outputPath, FoxHashLookup hashLookup)
     {
         Directory.CreateDirectory(Path.GetDirectoryName(outputPath) ?? Directory.GetCurrentDirectory());
 
@@ -33,10 +33,15 @@ internal sealed class GltfExporter
             BufferViews = new List<GltfBufferView>(),
             Buffers = new List<GltfBuffer>(),
             Materials = new List<GltfMaterial>(),
+            Images = new List<GltfImage>(),
+            Textures = new List<GltfTexture>(),
+            Samplers = new List<GltfSampler>(),
             Skins = new List<GltfSkin>(),
         };
 
         GltfBufferBuilder bufferBuilder = new();
+        TextureExportContext textureContext = new(gltf, bufferBuilder, sourceModelPath);
+        Dictionary<int, int> materialIndices = new();
 
         int rootNodeIndex = AddNode(gltf.Nodes, new GltfNode { Name = fmdl.Name });
         gltf.Scenes[0].Nodes = new List<int> { rootNodeIndex };
@@ -135,7 +140,7 @@ internal sealed class GltfExporter
                 (joints, weights, usedBones) = BuildSkinningData(meshData.BoneWeights, meshData.BoneIndices, fmdl.BoneGroups[meshInfo.BoneGroupIndex], jointRemap);
             }
 
-            int? materialIndex = BuildMaterial(gltf.Materials, fmdl, meshInfo, hashLookup);
+            int? materialIndex = BuildMaterial(gltf, fmdl, meshInfo, hashLookup, textureContext, materialIndices);
             int gltfMeshIndex = BuildMesh(gltf, bufferBuilder, meshIndex, positions, normals, tangents, colors, uv0, uv1, uv2, uv3, joints, weights, indices, materialIndex);
             int? skinIndex = BuildSkin(gltf, bufferBuilder, meshIndex, usedBones, boneNodeIndices, boneWorldPositions);
 
@@ -300,11 +305,22 @@ internal sealed class GltfExporter
         return skinIndex;
     }
 
-    private static int? BuildMaterial(List<GltfMaterial> gltfMaterials, FmdlFile fmdl, FmdlMeshInfo meshInfo, FoxHashLookup hashLookup)
+    private static int? BuildMaterial(
+        GltfRoot gltf,
+        FmdlFile fmdl,
+        FmdlMeshInfo meshInfo,
+        FoxHashLookup hashLookup,
+        TextureExportContext textureContext,
+        Dictionary<int, int> materialIndices)
     {
         if (meshInfo.MaterialInstanceIndex >= fmdl.MaterialInstances.Length)
         {
             return null;
+        }
+
+        if (materialIndices.TryGetValue(meshInfo.MaterialInstanceIndex, out int existingMaterialIndex))
+        {
+            return existingMaterialIndex;
         }
 
         FmdlMaterialInstance materialInstance = fmdl.MaterialInstances[meshInfo.MaterialInstanceIndex];
@@ -314,6 +330,7 @@ internal sealed class GltfExporter
             : "UnknownShader";
 
         Dictionary<string, object?> textureExtras = new(StringComparer.Ordinal);
+        Dictionary<string, string> textureReferences = new(StringComparer.Ordinal);
         for (int index = materialInstance.FirstTextureIndex; index < materialInstance.FirstTextureIndex + materialInstance.TextureCount; index++)
         {
             if (index >= fmdl.MaterialParameters.Length)
@@ -327,14 +344,17 @@ internal sealed class GltfExporter
             if (materialParameter.ReferenceIndex < fmdl.Textures.Length)
             {
                 FmdlTexture texture = fmdl.Textures[materialParameter.ReferenceIndex];
+                string reference = fmdl.ResolveTextureReference(texture, hashLookup);
+                textureReferences[slotName] = reference;
                 textureExtras[slotName] = new Dictionary<string, object?>
                 {
-                    ["reference"] = fmdl.ResolveTextureReference(texture, hashLookup),
+                    ["reference"] = reference,
                 };
             }
         }
 
         Dictionary<string, object?> parameterExtras = new(StringComparer.Ordinal);
+        Dictionary<string, Vector4> parameterValues = new(StringComparer.Ordinal);
         for (int index = materialInstance.FirstParameterIndex; index < materialInstance.FirstParameterIndex + materialInstance.ParameterCount; index++)
         {
             if (index >= fmdl.MaterialParameters.Length)
@@ -348,6 +368,7 @@ internal sealed class GltfExporter
             if (materialParameter.ReferenceIndex < fmdl.MaterialParameterVectors.Length)
             {
                 Vector4 parameterValue = fmdl.MaterialParameterVectors[materialParameter.ReferenceIndex];
+                parameterValues[parameterName] = parameterValue;
                 parameterExtras[parameterName] = new[] { parameterValue.X, parameterValue.Y, parameterValue.Z, parameterValue.W };
             }
         }
@@ -359,27 +380,147 @@ internal sealed class GltfExporter
             _ => "BLEND",
         };
 
-        int materialIndex = gltfMaterials.Count;
-        gltfMaterials.Add(new GltfMaterial
+        GltfPbrMetallicRoughness pbrMetallicRoughness = new()
+        {
+            BaseColorFactor = FindBaseColorFactor(parameterValues),
+            MetallicFactor = FindMetallicFactor(parameterValues),
+            RoughnessFactor = FindRoughnessFactor(parameterValues),
+        };
+
+        GltfMaterial material = new()
         {
             Name = materialName,
             DoubleSided = meshInfo.AlphaEnum == 0x20,
             AlphaMode = alphaMode,
-            PbrMetallicRoughness = new GltfPbrMetallicRoughness
-            {
-                BaseColorFactor = new[] { 1.0f, 1.0f, 1.0f, 1.0f },
-                MetallicFactor = 0.0f,
-                RoughnessFactor = 1.0f,
-            },
+            PbrMetallicRoughness = pbrMetallicRoughness,
+            EmissiveFactor = [0.0f, 0.0f, 0.0f],
             Extras = new Dictionary<string, object?>
             {
                 ["foxShader"] = shaderName,
                 ["foxTextureSlots"] = textureExtras,
                 ["foxParameters"] = parameterExtras,
             },
-        });
+        };
 
+        ApplyTextureAssignments(material, pbrMetallicRoughness, textureReferences, textureContext);
+
+        int materialIndex = gltf.Materials.Count;
+        gltf.Materials.Add(material);
+        materialIndices.Add(meshInfo.MaterialInstanceIndex, materialIndex);
         return materialIndex;
+    }
+
+    private static void ApplyTextureAssignments(
+        GltfMaterial material,
+        GltfPbrMetallicRoughness pbrMetallicRoughness,
+        Dictionary<string, string> textureReferences,
+        TextureExportContext textureContext)
+    {
+        foreach ((string slotName, string reference) in textureReferences)
+        {
+            FoxTextureUsage usage = IsNormalSlot(slotName) ? FoxTextureUsage.Normal : FoxTextureUsage.Default;
+            int? textureIndex = textureContext.AddTexture(reference, usage);
+            if (textureIndex is null)
+            {
+                continue;
+            }
+
+            if (IsBaseColorSlot(slotName))
+            {
+                pbrMetallicRoughness.BaseColorTexture ??= new GltfTextureInfo { Index = textureIndex.Value };
+            }
+            else if (IsNormalSlot(slotName))
+            {
+                material.NormalTexture ??= new GltfNormalTextureInfo { Index = textureIndex.Value, Scale = 1.0f };
+            }
+            else if (IsOrmSlot(slotName))
+            {
+                pbrMetallicRoughness.MetallicRoughnessTexture ??= new GltfTextureInfo { Index = textureIndex.Value };
+                material.OcclusionTexture ??= new GltfOcclusionTextureInfo { Index = textureIndex.Value, Strength = 1.0f };
+            }
+            else if (IsEmissiveSlot(slotName))
+            {
+                material.EmissiveTexture ??= new GltfTextureInfo { Index = textureIndex.Value };
+                material.EmissiveFactor = [1.0f, 1.0f, 1.0f];
+            }
+        }
+    }
+
+    private static bool IsBaseColorSlot(string slotName)
+    {
+        return slotName.Contains("Base_Tex", StringComparison.OrdinalIgnoreCase);
+    }
+
+    private static bool IsNormalSlot(string slotName)
+    {
+        return slotName.Contains("NormalMap", StringComparison.OrdinalIgnoreCase);
+    }
+
+    private static bool IsOrmSlot(string slotName)
+    {
+        return slotName.Contains("SpecularMap", StringComparison.OrdinalIgnoreCase) ||
+               slotName.Contains("SRM", StringComparison.OrdinalIgnoreCase);
+    }
+
+    private static bool IsEmissiveSlot(string slotName)
+    {
+        return slotName.Contains("Emissive", StringComparison.OrdinalIgnoreCase);
+    }
+
+    private static float[] FindBaseColorFactor(Dictionary<string, Vector4> parameterValues)
+    {
+        foreach ((string name, Vector4 value) in parameterValues)
+        {
+            if (name.Contains("BaseColor", StringComparison.OrdinalIgnoreCase) ||
+                name.Contains("TempolaryBaseColor", StringComparison.OrdinalIgnoreCase))
+            {
+                return
+                [
+                    Clamp01(value.X),
+                    Clamp01(value.Y),
+                    Clamp01(value.Z),
+                    Clamp01(value.W == 0 ? 1.0f : value.W),
+                ];
+            }
+        }
+
+        return [1.0f, 1.0f, 1.0f, 1.0f];
+    }
+
+    private static float FindMetallicFactor(Dictionary<string, Vector4> parameterValues)
+    {
+        foreach ((string name, Vector4 value) in parameterValues)
+        {
+            if (name.Contains("metal", StringComparison.OrdinalIgnoreCase))
+            {
+                return Clamp01(value.X);
+            }
+        }
+
+        return 1.0f;
+    }
+
+    private static float FindRoughnessFactor(Dictionary<string, Vector4> parameterValues)
+    {
+        foreach ((string name, Vector4 value) in parameterValues)
+        {
+            if (name.Contains("roughness", StringComparison.OrdinalIgnoreCase))
+            {
+                return Clamp01(value.X);
+            }
+
+            if (name.Contains("gloss", StringComparison.OrdinalIgnoreCase))
+            {
+                return Clamp01(1.0f - value.X);
+            }
+        }
+
+        return 1.0f;
+    }
+
+    private static float Clamp01(float value)
+    {
+        return Math.Clamp(value, 0.0f, 1.0f);
     }
 
     private static (ushort[] Joints, Vector4[] Weights, List<int> UsedBones) BuildSkinningData(
@@ -803,6 +944,20 @@ internal sealed class GltfBufferBuilder
         return offset;
     }
 
+    public int AddBytes(IReadOnlyList<byte> values)
+    {
+        Align(4);
+        int offset = (int)stream.Position;
+
+        foreach (byte value in values)
+        {
+            writer.Write(value);
+        }
+
+        Align(4);
+        return offset;
+    }
+
     public byte[] ToArray()
     {
         return stream.ToArray();
@@ -828,6 +983,9 @@ internal sealed class GltfRoot
     public required List<GltfBufferView> BufferViews { get; init; }
     public required List<GltfBuffer> Buffers { get; init; }
     public required List<GltfMaterial> Materials { get; init; }
+    public required List<GltfImage> Images { get; init; }
+    public required List<GltfTexture> Textures { get; init; }
+    public required List<GltfSampler> Samplers { get; init; }
     public required List<GltfSkin> Skins { get; init; }
 }
 
@@ -897,14 +1055,20 @@ internal sealed class GltfMaterial
     public GltfPbrMetallicRoughness? PbrMetallicRoughness { get; init; }
     public bool? DoubleSided { get; init; }
     public string? AlphaMode { get; init; }
+    public GltfNormalTextureInfo? NormalTexture { get; set; }
+    public GltfOcclusionTextureInfo? OcclusionTexture { get; set; }
+    public GltfTextureInfo? EmissiveTexture { get; set; }
+    public float[]? EmissiveFactor { get; set; }
     public Dictionary<string, object?>? Extras { get; init; }
 }
 
 internal sealed class GltfPbrMetallicRoughness
 {
     public float[]? BaseColorFactor { get; init; }
+    public GltfTextureInfo? BaseColorTexture { get; set; }
     public float MetallicFactor { get; init; }
     public float RoughnessFactor { get; init; }
+    public GltfTextureInfo? MetallicRoughnessTexture { get; set; }
 }
 
 internal sealed class GltfSkin
@@ -913,4 +1077,43 @@ internal sealed class GltfSkin
     public int? InverseBindMatrices { get; init; }
     public required List<int> Joints { get; init; }
     public int? Skeleton { get; init; }
+}
+
+internal sealed class GltfImage
+{
+    public string? Name { get; init; }
+    public int? BufferView { get; init; }
+    public string? MimeType { get; init; }
+    public string? Uri { get; init; }
+}
+
+internal sealed class GltfTexture
+{
+    public string? Name { get; init; }
+    public int? Sampler { get; init; }
+    public required int Source { get; init; }
+}
+
+internal sealed class GltfSampler
+{
+    public int? MagFilter { get; init; }
+    public int? MinFilter { get; init; }
+    public int? WrapS { get; init; }
+    public int? WrapT { get; init; }
+}
+
+internal class GltfTextureInfo
+{
+    public required int Index { get; init; }
+    public int? TexCoord { get; init; }
+}
+
+internal sealed class GltfNormalTextureInfo : GltfTextureInfo
+{
+    public float? Scale { get; init; }
+}
+
+internal sealed class GltfOcclusionTextureInfo : GltfTextureInfo
+{
+    public float? Strength { get; init; }
 }

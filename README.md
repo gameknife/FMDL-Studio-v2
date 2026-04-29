@@ -33,10 +33,14 @@ dotnet run --project .\tools\FmdlGltfConverter\FmdlGltfConverter.csproj -- .\mod
 ### Current output
 - Meshes, triangle indices, normals, tangents, vertex colors, UV0-UV3
 - Bone hierarchy, skinning, inverse bind matrices
+- glTF PBR materials with embedded textures for:
+  - `Base_Tex_SRGB` -> base color
+  - `NormalMap_Tex_NRM` -> normal (Fox `HNM` alpha/green packing is converted to standard glTF tangent-space RGB)
+  - `SpecularMap_Tex_LIN` -> ORM (`R=AO`, `G=roughness`, `B=metallic`)
 - Material names, Fox shader names, texture slots, and vector parameters in glTF `extras`
 
 ### Current limitations
-- The standalone converter preserves Fox texture references as metadata, but does not transcode Fox Engine texture assets into glTF-compatible image payloads.
+- Texture embedding currently targets the common Fox texture paths used by the sampled static assets and decodes `.ftex` / `.ftexs`, `.dds`, and common image files into PNG payloads for glTF/GLB.
 - Output is currently focused on `.fmdl` geometry and skinning data; Unity-specific editor workflows remain unchanged.
 
 ## Credits

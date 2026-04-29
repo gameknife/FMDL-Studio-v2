@@ -21,7 +21,7 @@ internal static class Program
                 try
                 {
                     FmdlFile fmdl = new FmdlParser().Read(job.InputPath);
-                    new GltfExporter().Export(fmdl, job.OutputPath, hashLookup);
+                    new GltfExporter().Export(fmdl, job.InputPath, job.OutputPath, hashLookup);
                     Console.WriteLine($"Wrote {job.OutputPath}");
                 }
                 catch (Exception exception)
