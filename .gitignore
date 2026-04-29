@@ -34,6 +34,10 @@ sysinfo.txt
 *.ide-shm
 *.ide-wal
 
+# Standalone converter source project
+!tools/FmdlGltfConverter/FmdlGltfConverter.csproj
+tools/FmdlGltfConverter/bin/
+
 ###
 # OS generated
 ###
