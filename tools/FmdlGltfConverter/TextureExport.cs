@@ -221,6 +221,7 @@ internal enum FoxTextureUsage
 {
     Default,
     Normal,
+    Roughness,
 }
 
 internal static class TextureTranscoder
@@ -263,11 +264,19 @@ internal static class TextureTranscoder
 
     private static void ApplyUsageTransform(Image<Rgba32> image, FoxTextureUsage usage)
     {
-        if (usage != FoxTextureUsage.Normal)
+        switch (usage)
         {
-            return;
+            case FoxTextureUsage.Normal:
+                ApplyNormalTransform(image);
+                break;
+            case FoxTextureUsage.Roughness:
+                ApplyRoughnessTransform(image);
+                break;
         }
+    }
 
+    private static void ApplyNormalTransform(Image<Rgba32> image)
+    {
         for (int y = 0; y < image.Height; y++)
         {
             for (int x = 0; x < image.Width; x++)
@@ -275,18 +284,25 @@ internal static class TextureTranscoder
                 Rgba32 pixel = image[x, y];
 
                 float nx = pixel.A / 255.0f;
-                float ny = 1.0f - (pixel.G / 255.0f);
-
-                float sx = nx * 2.0f - 1.0f;
-                float sy = ny * 2.0f - 1.0f;
-                float sz = MathF.Sqrt(MathF.Max(0.0f, 1.0f - (sx * sx + sy * sy)));
-                float nz = (sz * 0.5f) + 0.5f;
+                float ny = pixel.G / 255.0f;
 
                 image[x, y] = new Rgba32(
                     ToByte(nx),
                     ToByte(ny),
-                    ToByte(nz),
+                    255,
                     255);
+            }
+        }
+    }
+
+    private static void ApplyRoughnessTransform(Image<Rgba32> image)
+    {
+        for (int y = 0; y < image.Height; y++)
+        {
+            for (int x = 0; x < image.Width; x++)
+            {
+                byte roughness = image[x, y].G;
+                image[x, y] = new Rgba32(255, roughness, 0, 255);
             }
         }
     }
@@ -538,7 +554,20 @@ internal static class TextureTranscoder
             case ImageFormat.Rgba32:
                 for (int row = 0; row < image.Height; row++)
                 {
-                    Buffer.BlockCopy(sourceData, row * image.Stride, rgbaBytes, row * image.Width * 4, image.Width * 4);
+                    int sourceRowOffset = row * image.Stride;
+                    int destinationRowOffset = row * image.Width * 4;
+
+                    for (int column = 0; column < image.Width; column++)
+                    {
+                        int sourceOffset = sourceRowOffset + column * 4;
+                        int destinationOffset = destinationRowOffset + column * 4;
+
+                        // Pfim exposes decoded DDS pixels in BGRA byte order for 32-bit color.
+                        rgbaBytes[destinationOffset] = sourceData[sourceOffset + 2];
+                        rgbaBytes[destinationOffset + 1] = sourceData[sourceOffset + 1];
+                        rgbaBytes[destinationOffset + 2] = sourceData[sourceOffset];
+                        rgbaBytes[destinationOffset + 3] = sourceData[sourceOffset + 3];
+                    }
                 }
 
                 break;
@@ -553,9 +582,9 @@ internal static class TextureTranscoder
                         int sourceOffset = sourceRowOffset + column * 3;
                         int destinationOffset = destinationRowOffset + column * 4;
 
-                        rgbaBytes[destinationOffset] = sourceData[sourceOffset];
+                        rgbaBytes[destinationOffset] = sourceData[sourceOffset + 2];
                         rgbaBytes[destinationOffset + 1] = sourceData[sourceOffset + 1];
-                        rgbaBytes[destinationOffset + 2] = sourceData[sourceOffset + 2];
+                        rgbaBytes[destinationOffset + 2] = sourceData[sourceOffset];
                         rgbaBytes[destinationOffset + 3] = 255;
                     }
                 }

@@ -74,7 +74,7 @@ internal sealed class GltfExporter
 
             if (parentIndex >= 0)
             {
-                AddChild(gltf.Nodes[parentIndex], boneNodeIndices[boneIndex]);
+                AddChild(gltf.Nodes[boneNodeIndices[parentIndex]], boneNodeIndices[boneIndex]);
             }
             else
             {
@@ -118,14 +118,13 @@ internal sealed class GltfExporter
             FmdlMeshInfo meshInfo = fmdl.MeshInfos[meshIndex];
             int vertexCount = meshData.Vertices.Length;
 
-            Vector3[] positions = meshData.Vertices.Select(ConvertPosition).ToArray();
-            Vector3[]? normals = meshData.Normals?.Select(value => new Vector3(-value.X, value.Y, value.Z)).ToArray();
-            Vector4[]? tangents = meshData.Tangents?.Select(value => new Vector4(-value.X, value.Y, value.Z, value.W)).ToArray();
-            Vector4[]? colors = meshData.Colors?.Select(value => value / 255.0f).ToArray();
-            Vector2[]? uv0 = meshData.Uv?.Select(FlipUv).ToArray();
-            Vector2[]? uv1 = meshData.Uv2?.Select(FlipUv).ToArray();
-            Vector2[]? uv2 = meshData.Uv3?.Select(FlipUv).ToArray();
-            Vector2[]? uv3 = meshData.Uv4?.Select(FlipUv).ToArray();
+            Vector3[] positions = meshData.Vertices.Select(value => ConvertPosition(value)).ToArray();
+            Vector3[]? normals = meshData.Normals?.Select(value => ConvertDirection(ToVector3(value))).ToArray();
+            Vector4[]? tangents = meshData.Tangents?.Select(value => ConvertTangent(value)).ToArray();
+            Vector2[]? uv0 = meshData.Uv?.Select(ConvertUv).ToArray();
+            Vector2[]? uv1 = meshData.Uv2?.Select(ConvertUv).ToArray();
+            Vector2[]? uv2 = meshData.Uv3?.Select(ConvertUv).ToArray();
+            Vector2[]? uv3 = meshData.Uv4?.Select(ConvertUv).ToArray();
             ushort[] indices = BuildTriangleIndices(meshData.Triangles, vertexCount);
 
             Dictionary<int, int> jointRemap = new();
@@ -141,8 +140,8 @@ internal sealed class GltfExporter
             }
 
             int? materialIndex = BuildMaterial(gltf, fmdl, meshInfo, hashLookup, textureContext, materialIndices);
-            int gltfMeshIndex = BuildMesh(gltf, bufferBuilder, meshIndex, positions, normals, tangents, colors, uv0, uv1, uv2, uv3, joints, weights, indices, materialIndex);
-            int? skinIndex = BuildSkin(gltf, bufferBuilder, meshIndex, usedBones, boneNodeIndices, boneWorldPositions);
+            int gltfMeshIndex = BuildMesh(gltf, bufferBuilder, meshIndex, positions, normals, tangents, uv0, uv1, uv2, uv3, joints, weights, indices, materialIndex);
+            int? skinIndex = BuildSkin(gltf, bufferBuilder, meshIndex, usedBones, fmdl.Bones, boneNodeIndices, boneWorldPositions);
 
             int meshGroupIndex = fmdl.GetMeshGroupIndex(meshIndex);
             string meshName = meshGroupIndex >= 0
@@ -192,7 +191,6 @@ internal sealed class GltfExporter
         Vector3[] positions,
         Vector3[]? normals,
         Vector4[]? tangents,
-        Vector4[]? colors,
         Vector2[]? uv0,
         Vector2[]? uv1,
         Vector2[]? uv2,
@@ -215,11 +213,6 @@ internal sealed class GltfExporter
         if (tangents is not null)
         {
             attributes["TANGENT"] = AddVector4Accessor(gltf, bufferBuilder, tangents, target: 34962);
-        }
-
-        if (colors is not null)
-        {
-            attributes["COLOR_0"] = AddVector4Accessor(gltf, bufferBuilder, colors, target: 34962);
         }
 
         if (uv0 is not null)
@@ -274,6 +267,7 @@ internal sealed class GltfExporter
         GltfBufferBuilder bufferBuilder,
         int meshIndex,
         List<int> usedBones,
+        FmdlBone[] bones,
         int[] boneNodeIndices,
         Vector3[] boneWorldPositions)
     {
@@ -293,16 +287,29 @@ internal sealed class GltfExporter
         }
 
         int inverseBindAccessor = AddMatrix4Accessor(gltf, bufferBuilder, inverseBindMatrices);
+        int skeletonRootBoneIndex = FindSkeletonRootBoneIndex(usedBones[0], bones);
         int skinIndex = gltf.Skins.Count;
         gltf.Skins.Add(new GltfSkin
         {
             Name = $"Skin_{meshIndex:D3}",
             InverseBindMatrices = inverseBindAccessor,
             Joints = joints.ToList(),
-            Skeleton = joints[0],
+            Skeleton = boneNodeIndices[skeletonRootBoneIndex],
         });
 
         return skinIndex;
+    }
+
+    private static int FindSkeletonRootBoneIndex(int boneIndex, FmdlBone[] bones)
+    {
+        int current = boneIndex;
+
+        while (bones[current].ParentIndex >= 0)
+        {
+            current = bones[current].ParentIndex;
+        }
+
+        return current;
     }
 
     private static int? BuildMaterial(
@@ -383,7 +390,7 @@ internal sealed class GltfExporter
         GltfPbrMetallicRoughness pbrMetallicRoughness = new()
         {
             BaseColorFactor = FindBaseColorFactor(parameterValues),
-            MetallicFactor = FindMetallicFactor(parameterValues),
+            MetallicFactor = 0.0f,
             RoughnessFactor = FindRoughnessFactor(parameterValues),
         };
 
@@ -418,7 +425,7 @@ internal sealed class GltfExporter
     {
         foreach ((string slotName, string reference) in textureReferences)
         {
-            FoxTextureUsage usage = IsNormalSlot(slotName) ? FoxTextureUsage.Normal : FoxTextureUsage.Default;
+            FoxTextureUsage usage = GetTextureUsage(slotName);
             int? textureIndex = textureContext.AddTexture(reference, usage);
             if (textureIndex is null)
             {
@@ -433,10 +440,9 @@ internal sealed class GltfExporter
             {
                 material.NormalTexture ??= new GltfNormalTextureInfo { Index = textureIndex.Value, Scale = 1.0f };
             }
-            else if (IsOrmSlot(slotName))
+            else if (IsRoughnessSlot(slotName))
             {
                 pbrMetallicRoughness.MetallicRoughnessTexture ??= new GltfTextureInfo { Index = textureIndex.Value };
-                material.OcclusionTexture ??= new GltfOcclusionTextureInfo { Index = textureIndex.Value, Strength = 1.0f };
             }
             else if (IsEmissiveSlot(slotName))
             {
@@ -456,10 +462,25 @@ internal sealed class GltfExporter
         return slotName.Contains("NormalMap", StringComparison.OrdinalIgnoreCase);
     }
 
-    private static bool IsOrmSlot(string slotName)
+    private static bool IsRoughnessSlot(string slotName)
     {
         return slotName.Contains("SpecularMap", StringComparison.OrdinalIgnoreCase) ||
                slotName.Contains("SRM", StringComparison.OrdinalIgnoreCase);
+    }
+
+    private static FoxTextureUsage GetTextureUsage(string slotName)
+    {
+        if (IsNormalSlot(slotName))
+        {
+            return FoxTextureUsage.Normal;
+        }
+
+        if (IsRoughnessSlot(slotName))
+        {
+            return FoxTextureUsage.Roughness;
+        }
+
+        return FoxTextureUsage.Default;
     }
 
     private static bool IsEmissiveSlot(string slotName)
@@ -485,19 +506,6 @@ internal sealed class GltfExporter
         }
 
         return [1.0f, 1.0f, 1.0f, 1.0f];
-    }
-
-    private static float FindMetallicFactor(Dictionary<string, Vector4> parameterValues)
-    {
-        foreach ((string name, Vector4 value) in parameterValues)
-        {
-            if (name.Contains("metal", StringComparison.OrdinalIgnoreCase))
-            {
-                return Clamp01(value.X);
-            }
-        }
-
-        return 1.0f;
     }
 
     private static float FindRoughnessFactor(Dictionary<string, Vector4> parameterValues)
@@ -597,11 +605,11 @@ internal sealed class GltfExporter
 
         for (int index = 0; index + 2 < sourceTriangles.Length; index += 3)
         {
-            // ConvertPosition already mirrors the mesh across X, so preserving the
-            // original index order keeps front faces oriented correctly for glTF.
+            // Fox meshes use the opposite winding from glTF's default front-face
+            // convention, so swap the last two vertices of each triangle.
             indices[index] = (ushort)(sourceTriangles[index] % vertexCount);
-            indices[index + 1] = (ushort)(sourceTriangles[index + 1] % vertexCount);
-            indices[index + 2] = (ushort)(sourceTriangles[index + 2] % vertexCount);
+            indices[index + 1] = (ushort)(sourceTriangles[index + 2] % vertexCount);
+            indices[index + 2] = (ushort)(sourceTriangles[index + 1] % vertexCount);
         }
 
         return indices;
@@ -622,7 +630,17 @@ internal sealed class GltfExporter
 
     private static Vector3 ConvertPosition(Vector3 input)
     {
-        return new Vector3(-input.X, input.Y, input.Z);
+        return input;
+    }
+
+    private static Vector3 ConvertDirection(Vector3 input)
+    {
+        return input;
+    }
+
+    private static Vector4 ConvertTangent(Vector4 input)
+    {
+        return input;
     }
 
     private static Vector3 ToVector3(Vector4 input)
@@ -630,9 +648,11 @@ internal sealed class GltfExporter
         return new Vector3(input.X, input.Y, input.Z);
     }
 
-    private static Vector2 FlipUv(Vector2 input)
+    private static Vector2 ConvertUv(Vector2 input)
     {
-        return new Vector2(input.X, 1 - input.Y);
+        // FMDL Studio flips V for Unity's UV convention. glTF uses the original
+        // top-left texture orientation, so the stored FMDL UVs can be emitted as-is.
+        return input;
     }
 
     private static float[] ToArray(Vector3 input)
