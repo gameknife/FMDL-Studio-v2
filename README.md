@@ -84,6 +84,71 @@ dotnet run --project .\tools\Fox2SceneConverter\Fox2SceneConverter.csproj -- `
 - Exact node-to-model binding is best-effort. Many useful `.fmdl` paths are discovered through referenced fox2/archive files rather than a single explicit property on each node.
 - Archive parsing is currently string-scan based for `.fstb`, `.fpk`, and `.fpkd`, which is good enough for discovery but not yet a full semantic parser for every Fox container format.
 
+## Blender compact scene importer
+For Blender-side scene assembly, the repository now includes `tools\Blender\import_fox2_scene.py`.
+
+The script reads a `*.scene.compact.json` file, converts the required `.fmdl` files to cached `.glb` files through `FmdlGltfConverter`, imports each model once, and then duplicates the imported object trees to reconstruct the scene hierarchy using the recorded transforms.
+
+### Run from Blender
+```powershell
+blender --python .\tools\Blender\import_fox2_scene.py -- `
+  --scene-json "D:\BOTW\MGSV\Root\Assets\tpp\level\location\mbqf\mbqf_stage.scene.compact.json"
+```
+
+Useful optional arguments:
+- `--asset-root <path>` to override the asset root from the compact JSON
+- `--converter <path>` to point at an explicit `FmdlGltfConverter.exe` or `.dll`
+- `--cache-dir <path>` to control where generated `.glb` files are stored
+- `--rebuild-glb` to force reconversion even if cached `.glb` files already exist
+- `--disable-name-fallback` to disable best-effort node-name-to-model matching when a node has no explicit `fmdlPaths`
+
+### Import behavior
+- Uses node-level `fmdlPaths` first when present in the compact JSON
+- Falls back to best-effort node-name matching against the fox2 file's `fmdlFiles` list when direct node model paths are missing
+- Preserves the compact scene transform hierarchy with Blender empties and attaches imported model instances under those nodes
+- Reuses cached imported templates so repeated model placements do not re-run the converter
+
+### Current limitations
+- The Blender importer depends on Blender's Python API and is meant to run inside Blender, not plain CPython.
+- When the compact JSON only provides file-level model discovery and no direct node-level binding, the importer uses name matching heuristics; these placements are useful for quick scene assembly but are not guaranteed to be exact.
+
+## Compact scene glTF/GLB composer
+For direct scene export without going through Blender, the repository also includes `tools\SceneGltfComposer`.
+
+The composer reads a `*.scene.compact.json` file, converts each unique referenced `.fmdl` to a cached `.glb` through `FmdlGltfConverter`, merges those model assets into one final scene, and recreates the compact scene transform hierarchy as glTF nodes. Repeated placements of the same model reuse the same imported mesh/material/accessor data.
+
+### Build
+```powershell
+dotnet build .\tools\SceneGltfComposer\SceneGltfComposer.csproj
+```
+
+### Run
+```powershell
+dotnet run --project .\tools\SceneGltfComposer\SceneGltfComposer.csproj -- `
+  "D:\BOTW\MGSV\Root\Assets\tpp\level\location\mafr\block_large\lab\mafr_lab_asset_room.scene.compact.json" `
+  ".\mafr_lab_asset_room.scene.glb" `
+  --asset-root "D:\BOTW\MGSV\Root"
+```
+
+If you omit the output path, the composer writes `<input without .compact>.glb` beside the compact scene JSON. Use a `.gltf` output extension if you want a `.gltf + .bin` pair instead of a `.glb`.
+
+Useful optional arguments:
+- `--converter <path>` to point at an explicit `FmdlGltfConverter.exe` or `.dll`
+- `--cache-dir <path>` to control where per-model cached `.glb` files are stored
+- `--rebuild-models` to force reconversion even when cached `.glb` files already exist
+- `--disable-name-fallback` to disable best-effort node-name-to-model matching when a node has no explicit `fmdlPaths`
+
+### Composition behavior
+- Uses node-level `fmdlPaths` first when present in the compact JSON
+- Falls back to best-effort node-name matching against the fox2 file's `fmdlFiles` list when direct node model paths are missing
+- Recreates the compact transform hierarchy as glTF nodes and instantiates the referenced model scenes under those nodes
+- Imports each unique source model once, then reuses the merged mesh/material/buffer data for repeated placements
+
+### Current limitations
+- The output scene currently duplicates model node trees per placement; mesh/material/accessor data is shared, but node hierarchies themselves are not deduplicated because vanilla glTF has no generic scene-instancing primitive.
+- Placement quality still depends on the compact JSON. When only file-level model discovery is available, the name fallback is heuristic and not guaranteed to bind the exact intended `.fmdl`.
+- The current implementation expects cached source models as `.glb` produced by this repository's `FmdlGltfConverter`.
+
 ## Credits
 BobDoleOwndU: Programming and reverse-engineering.
 

@@ -33,12 +33,16 @@ sysinfo.txt
 *.lock
 *.ide-shm
 *.ide-wal
+__pycache__/
+*.pyc
 
 # Standalone converter source project
 !tools/FmdlGltfConverter/FmdlGltfConverter.csproj
 tools/FmdlGltfConverter/bin/
 !tools/Fox2SceneConverter/Fox2SceneConverter.csproj
 tools/Fox2SceneConverter/bin/
+!tools/SceneGltfComposer/SceneGltfComposer.csproj
+tools/SceneGltfComposer/bin/
 
 ###
 # OS generated
