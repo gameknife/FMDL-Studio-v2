@@ -33,7 +33,13 @@ internal sealed class SceneComposer
 
     private readonly MemoryStream bufferStream = new();
     private readonly Dictionary<string, ImportedModelTemplate> importedModels = new(StringComparer.OrdinalIgnoreCase);
+    private readonly Dictionary<string, int> samplerIndicesBySignature = new(StringComparer.Ordinal);
+    private readonly Dictionary<string, int> imageIndicesBySignature = new(StringComparer.Ordinal);
+    private readonly Dictionary<string, int> imageBufferViewIndicesBySignature = new(StringComparer.Ordinal);
+    private readonly Dictionary<string, int> textureIndicesBySignature = new(StringComparer.Ordinal);
+    private readonly Dictionary<string, int> materialIndicesBySignature = new(StringComparer.Ordinal);
     private readonly Dictionary<string, List<string>> fileModelsByPath;
+    private readonly TerrainComposer terrainComposer;
 
     public SceneComposer(CliOptions options)
     {
@@ -46,6 +52,7 @@ internal sealed class SceneComposer
             file => file.Path,
             file => file.FmdlFiles ?? [],
             StringComparer.OrdinalIgnoreCase);
+        terrainComposer = new TerrainComposer(scene, bufferStream, assetRootPath, options.OutputPath);
     }
 
     public void Compose(string outputPath)
@@ -65,8 +72,17 @@ internal sealed class SceneComposer
             }
         }
 
-        scene.Buffers[0].ByteLength = checked((int)bufferStream.Length);
-        GltfBinary.Write(outputPath, scene, bufferStream.ToArray());
+        try
+        {
+            byte[] optimizedBuffer = SceneAssetDeduplicator.Optimize(scene, bufferStream.ToArray());
+            scene.Buffers[0].ByteLength = optimizedBuffer.Length;
+            GltfBinary.Write(outputPath, scene, optimizedBuffer);
+        }
+        catch (Exception exception) when (exception.Message.Contains("Stream was too long", StringComparison.Ordinal))
+        {
+            scene.Buffers[0].ByteLength = checked((int)bufferStream.Length);
+            GltfBinary.Write(outputPath, scene, bufferStream);
+        }
     }
 
     private void BuildSceneNode(CompactSceneNode compactNode, CompactSceneFile file, int parentIndex)
@@ -82,6 +98,8 @@ internal sealed class SceneComposer
             node.Rotation = compactNode.Transform.RotationQuaternion?.ToArray();
             node.Scale = compactNode.Transform.Scale?.ToArray();
         }
+
+        terrainComposer.ApplyToNode(node, compactNode);
 
         int nodeIndex = AddNode(node);
         AddChild(scene.Nodes[parentIndex], nodeIndex);
@@ -105,7 +123,9 @@ internal sealed class SceneComposer
             return node.FmdlPaths.Distinct(StringComparer.OrdinalIgnoreCase).ToList();
         }
 
-        if (options.DisableNameFallback || string.IsNullOrWhiteSpace(node.Name))
+        if (options.DisableNameFallback ||
+            string.IsNullOrWhiteSpace(node.Name) ||
+            ShouldSuppressNameFallback(node.Name!))
         {
             return Array.Empty<string>();
         }
@@ -197,6 +217,24 @@ internal sealed class SceneComposer
         return Regex.Replace(value.ToLowerInvariant(), "[^a-z0-9]+", "_").Trim('_');
     }
 
+    private static bool ShouldSuppressNameFallback(string nodeName)
+    {
+        int separatorIndex = nodeName.IndexOf('|');
+        if (separatorIndex < 0 || separatorIndex == nodeName.Length - 1)
+        {
+            return false;
+        }
+
+        string suffix = nodeName[(separatorIndex + 1)..];
+        return suffix.StartsWith("TppSharedGimmick", StringComparison.Ordinal) ||
+               suffix.StartsWith("SL_", StringComparison.Ordinal) ||
+               suffix.StartsWith("PL_", StringComparison.Ordinal) ||
+               suffix.StartsWith("IP_SL_", StringComparison.Ordinal) ||
+               suffix.StartsWith("IP_PL_", StringComparison.Ordinal) ||
+               suffix.StartsWith("LA_SL_", StringComparison.Ordinal) ||
+               suffix.StartsWith("LA_PL_", StringComparison.Ordinal);
+    }
+
     private ImportedModelTemplate ImportModel(string assetPath)
     {
         if (importedModels.TryGetValue(assetPath, out ImportedModelTemplate? cached))
@@ -225,20 +263,42 @@ internal sealed class SceneComposer
 
     private ImportedModelTemplate MergeSourceModel(string assetPath, GltfDocument source)
     {
-        int bufferBaseOffset = AppendBinary(source.BinaryChunk);
+        Dictionary<int, string> imageSignaturesByBufferView = new();
+        foreach (GltfImage image in source.Root.Images)
+        {
+            string imageSignature = SceneAssetDeduplicator.GetImageSignature(image, source.Root.BufferViews, source.BinaryChunk);
+            if (image.BufferView.HasValue)
+            {
+                imageSignaturesByBufferView.TryAdd(image.BufferView.Value, imageSignature);
+            }
+        }
+
         int[] bufferViewMap = new int[source.Root.BufferViews.Count];
         for (int index = 0; index < source.Root.BufferViews.Count; index++)
         {
             GltfBufferView sourceView = source.Root.BufferViews[index];
+            if (imageSignaturesByBufferView.TryGetValue(index, out string? imageSignature) &&
+                imageBufferViewIndicesBySignature.TryGetValue(imageSignature, out int existingBufferViewIndex))
+            {
+                bufferViewMap[index] = existingBufferViewIndex;
+                continue;
+            }
+
+            int byteOffset = AppendBinary(source.BinaryChunk.AsSpan(sourceView.ByteOffset, sourceView.ByteLength));
             bufferViewMap[index] = scene.BufferViews.Count;
             scene.BufferViews.Add(new GltfBufferView
             {
                 Buffer = 0,
-                ByteOffset = bufferBaseOffset + sourceView.ByteOffset,
+                ByteOffset = byteOffset,
                 ByteLength = sourceView.ByteLength,
                 ByteStride = sourceView.ByteStride,
                 Target = sourceView.Target,
             });
+
+            if (imageSignaturesByBufferView.TryGetValue(index, out imageSignature))
+            {
+                imageBufferViewIndicesBySignature.TryAdd(imageSignature, bufferViewMap[index]);
+            }
         }
 
         int[] accessorMap = new int[source.Root.Accessors.Count];
@@ -263,60 +323,79 @@ internal sealed class SceneComposer
         for (int index = 0; index < source.Root.Samplers.Count; index++)
         {
             GltfSampler sampler = source.Root.Samplers[index];
-            samplerMap[index] = scene.Samplers.Count;
-            scene.Samplers.Add(new GltfSampler
+            string samplerSignature = SceneAssetDeduplicator.GetSamplerSignature(sampler);
+            if (!samplerIndicesBySignature.TryGetValue(samplerSignature, out int samplerIndex))
             {
-                MagFilter = sampler.MagFilter,
-                MinFilter = sampler.MinFilter,
-                WrapS = sampler.WrapS,
-                WrapT = sampler.WrapT,
-            });
+                samplerIndex = scene.Samplers.Count;
+                samplerIndicesBySignature.Add(samplerSignature, samplerIndex);
+                scene.Samplers.Add(new GltfSampler
+                {
+                    MagFilter = sampler.MagFilter,
+                    MinFilter = sampler.MinFilter,
+                    WrapS = sampler.WrapS,
+                    WrapT = sampler.WrapT,
+                });
+            }
+
+            samplerMap[index] = samplerIndex;
         }
 
         int[] imageMap = new int[source.Root.Images.Count];
         for (int index = 0; index < source.Root.Images.Count; index++)
         {
             GltfImage image = source.Root.Images[index];
-            imageMap[index] = scene.Images.Count;
-            scene.Images.Add(new GltfImage
+            string imageSignature = SceneAssetDeduplicator.GetImageSignature(image, source.Root.BufferViews, source.BinaryChunk);
+            if (!imageIndicesBySignature.TryGetValue(imageSignature, out int imageIndex))
             {
-                Name = image.Name,
-                BufferView = image.BufferView.HasValue ? bufferViewMap[image.BufferView.Value] : null,
-                MimeType = image.MimeType,
-                Uri = image.Uri,
-            });
+                imageIndex = scene.Images.Count;
+                imageIndicesBySignature.Add(imageSignature, imageIndex);
+                scene.Images.Add(new GltfImage
+                {
+                    Name = image.Name,
+                    BufferView = image.BufferView.HasValue ? bufferViewMap[image.BufferView.Value] : null,
+                    MimeType = image.MimeType,
+                    Uri = image.Uri,
+                });
+            }
+
+            imageMap[index] = imageIndex;
         }
 
         int[] textureMap = new int[source.Root.Textures.Count];
         for (int index = 0; index < source.Root.Textures.Count; index++)
         {
             GltfTexture texture = source.Root.Textures[index];
-            textureMap[index] = scene.Textures.Count;
-            scene.Textures.Add(new GltfTexture
+            int? samplerIndex = texture.Sampler.HasValue ? samplerMap[texture.Sampler.Value] : null;
+            int sourceIndex = imageMap[texture.Source];
+            string textureSignature = SceneAssetDeduplicator.GetTextureSignature(samplerIndex, sourceIndex);
+            if (!textureIndicesBySignature.TryGetValue(textureSignature, out int textureIndex))
             {
-                Name = texture.Name,
-                Sampler = texture.Sampler.HasValue ? samplerMap[texture.Sampler.Value] : null,
-                Source = imageMap[texture.Source],
-            });
+                textureIndex = scene.Textures.Count;
+                textureIndicesBySignature.Add(textureSignature, textureIndex);
+                scene.Textures.Add(new GltfTexture
+                {
+                    Name = texture.Name,
+                    Sampler = samplerIndex,
+                    Source = sourceIndex,
+                });
+            }
+
+            textureMap[index] = textureIndex;
         }
 
         int[] materialMap = new int[source.Root.Materials.Count];
         for (int index = 0; index < source.Root.Materials.Count; index++)
         {
-            GltfMaterial material = source.Root.Materials[index];
-            materialMap[index] = scene.Materials.Count;
-            scene.Materials.Add(new GltfMaterial
+            GltfMaterial material = SceneAssetDeduplicator.CloneMaterialWithRemappedTextures(source.Root.Materials[index], textureMap);
+            string materialSignature = SceneAssetDeduplicator.GetMaterialSignature(material);
+            if (!materialIndicesBySignature.TryGetValue(materialSignature, out int materialIndex))
             {
-                Name = material.Name,
-                PbrMetallicRoughness = RemapPbr(material.PbrMetallicRoughness, textureMap),
-                DoubleSided = material.DoubleSided,
-                AlphaMode = material.AlphaMode,
-                NormalTexture = RemapNormalTexture(material.NormalTexture, textureMap),
-                OcclusionTexture = RemapOcclusionTexture(material.OcclusionTexture, textureMap),
-                EmissiveTexture = RemapTextureInfo(material.EmissiveTexture, textureMap),
-                EmissiveFactor = material.EmissiveFactor is null ? null : (float[])material.EmissiveFactor.Clone(),
-                Extras = material.Extras,
-            });
+                materialIndex = scene.Materials.Count;
+                materialIndicesBySignature.Add(materialSignature, materialIndex);
+                scene.Materials.Add(material);
+            }
+
+            materialMap[index] = materialIndex;
         }
 
         int[] meshMap = new int[source.Root.Meshes.Count];
@@ -543,13 +622,18 @@ internal sealed class SceneComposer
 
     private int AppendBinary(byte[] bytes)
     {
+        return AppendBinary(bytes.AsSpan());
+    }
+
+    private int AppendBinary(ReadOnlySpan<byte> bytes)
+    {
         int alignedOffset = GltfBinary.Align4(checked((int)bufferStream.Length));
         while (bufferStream.Length < alignedOffset)
         {
             bufferStream.WriteByte(0);
         }
 
-        bufferStream.Write(bytes, 0, bytes.Length);
+        bufferStream.Write(bytes);
         return alignedOffset;
     }
 

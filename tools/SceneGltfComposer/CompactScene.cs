@@ -36,9 +36,11 @@ internal sealed class CompactSceneFile
 
 internal sealed class CompactSceneNode
 {
+    public string? ClassName { get; init; }
     public string? Name { get; init; }
     public CompactNodeTransform? Transform { get; init; }
     public List<string>? FmdlPaths { get; init; }
+    public Dictionary<string, JsonElement>? Properties { get; init; }
     public List<CompactSceneNode>? Children { get; init; }
 }
 

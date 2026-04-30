@@ -123,4 +123,9 @@ internal static class FoxHashing
     {
         return hash - PathCodeMask;
     }
+
+    public static bool HasPathCodePrefix(ulong hash)
+    {
+        return hash >= PathCodeMask;
+    }
 }

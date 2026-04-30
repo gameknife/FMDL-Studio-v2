@@ -72,6 +72,19 @@ internal static class GltfBinary
         }
     }
 
+    public static void Write(string outputPath, GltfRoot gltf, MemoryStream bufferData)
+    {
+        Directory.CreateDirectory(Path.GetDirectoryName(outputPath) ?? Directory.GetCurrentDirectory());
+        if (outputPath.EndsWith(".glb", StringComparison.OrdinalIgnoreCase))
+        {
+            WriteGlb(outputPath, gltf, bufferData);
+        }
+        else
+        {
+            WriteGltf(outputPath, gltf, bufferData);
+        }
+    }
+
     private static void WriteGltf(string outputPath, GltfRoot gltf, byte[] bufferData)
     {
         EnsureSingleBuffer(gltf, bufferData.Length);
@@ -110,6 +123,62 @@ internal static class GltfBinary
         writer.Write(BinChunkType);
         writer.Write(bufferData);
         for (int index = bufferData.Length; index < paddedBinLength; index++)
+        {
+            writer.Write((byte)0);
+        }
+    }
+
+    private static void WriteGltf(string outputPath, GltfRoot gltf, MemoryStream bufferData)
+    {
+        EnsureSingleBuffer(gltf, checked((int)bufferData.Length));
+        gltf.Buffers[0].Uri = Path.GetFileNameWithoutExtension(outputPath) + ".bin";
+        string json = JsonSerializer.Serialize(gltf, GltfJson.SerializerOptions);
+        File.WriteAllText(outputPath, json, Encoding.UTF8);
+
+        using FileStream binaryStream = File.Create(Path.ChangeExtension(outputPath, ".bin"));
+        bufferData.Position = 0;
+        bufferData.CopyTo(binaryStream);
+    }
+
+    private static void WriteGlb(string outputPath, GltfRoot gltf, MemoryStream bufferData)
+    {
+        int bufferLength = checked((int)bufferData.Length);
+        EnsureSingleBuffer(gltf, bufferLength);
+        gltf.Buffers[0].Uri = null;
+        byte[] jsonBytes = JsonSerializer.SerializeToUtf8Bytes(gltf, GltfJson.SerializerOptions);
+
+        int paddedJsonLength = Align4(jsonBytes.Length);
+        int paddedBinLength = Align4(bufferLength);
+        int totalLength = 12 + 8 + paddedJsonLength + 8 + paddedBinLength;
+
+        using FileStream stream = File.Create(outputPath);
+        using BinaryWriter writer = new(stream, Encoding.UTF8, leaveOpen: false);
+
+        writer.Write(GlbMagic);
+        writer.Write(2u);
+        writer.Write(totalLength);
+
+        writer.Write(paddedJsonLength);
+        writer.Write(JsonChunkType);
+        writer.Write(jsonBytes);
+        for (int index = jsonBytes.Length; index < paddedJsonLength; index++)
+        {
+            writer.Write((byte)0x20);
+        }
+
+        writer.Write(paddedBinLength);
+        writer.Write(BinChunkType);
+        if (bufferData.TryGetBuffer(out ArraySegment<byte> segment))
+        {
+            writer.Write(segment.Array!, segment.Offset, bufferLength);
+        }
+        else
+        {
+            bufferData.Position = 0;
+            bufferData.CopyTo(stream);
+        }
+
+        for (int index = bufferLength; index < paddedBinLength; index++)
         {
             writer.Write((byte)0);
         }

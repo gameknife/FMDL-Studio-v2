@@ -77,6 +77,8 @@ internal sealed class TextureExportContext
 internal sealed class FoxTextureResolver
 {
     private static readonly string[] SupportedExtensions = [".ftex", ".dds", ".png", ".tga", ".jpg", ".jpeg", ".bmp"];
+    private static readonly object HashedTextureIndexLock = new();
+    private static readonly Dictionary<string, IReadOnlyDictionary<ulong, string>> HashedTextureIndicesByAssetsRoot = new(StringComparer.OrdinalIgnoreCase);
 
     private readonly string modelDirectory;
     private readonly string? assetsRoot;
@@ -124,6 +126,12 @@ internal sealed class FoxTextureResolver
             {
                 return candidate;
             }
+        }
+
+        string? hashedMatch = FindHashedTexturePath(reference);
+        if (hashedMatch is not null)
+        {
+            return hashedMatch;
         }
 
         return null;
@@ -212,6 +220,103 @@ internal sealed class FoxTextureResolver
         }
 
         return null;
+    }
+
+    private string? FindHashedTexturePath(string reference)
+    {
+        if (assetsRoot is null)
+        {
+            return null;
+        }
+
+        if (!TryParseHashReference(reference, out ulong rawHash, out ulong? strippedHash))
+        {
+            return null;
+        }
+
+        IReadOnlyDictionary<ulong, string> hashedTextureIndex = GetHashedTextureIndex(assetsRoot);
+        if (hashedTextureIndex.TryGetValue(rawHash, out string? texturePath))
+        {
+            return texturePath;
+        }
+
+        return strippedHash is ulong stripped && hashedTextureIndex.TryGetValue(stripped, out texturePath)
+            ? texturePath
+            : null;
+    }
+
+    private static bool TryParseHashReference(string reference, out ulong rawHash, out ulong? strippedHash)
+    {
+        string fileStem = Path.GetFileNameWithoutExtension(reference);
+        if (!ulong.TryParse(fileStem, System.Globalization.NumberStyles.HexNumber, null, out rawHash))
+        {
+            strippedHash = null;
+            return false;
+        }
+
+        strippedHash = FoxHashing.HasPathCodePrefix(rawHash)
+            ? FoxHashing.StripPathCodePrefix(rawHash)
+            : null;
+
+        return true;
+    }
+
+    private static IReadOnlyDictionary<ulong, string> GetHashedTextureIndex(string assetsRoot)
+    {
+        lock (HashedTextureIndexLock)
+        {
+            if (!HashedTextureIndicesByAssetsRoot.TryGetValue(assetsRoot, out IReadOnlyDictionary<ulong, string>? index))
+            {
+                index = BuildHashedTextureIndex(assetsRoot);
+                HashedTextureIndicesByAssetsRoot.Add(assetsRoot, index);
+            }
+
+            return index;
+        }
+    }
+
+    private static IReadOnlyDictionary<ulong, string> BuildHashedTextureIndex(string assetsRoot)
+    {
+        string assetsDirectory = Path.Combine(assetsRoot, "Assets");
+        Dictionary<ulong, string> index = new();
+        if (!Directory.Exists(assetsDirectory))
+        {
+            return index;
+        }
+
+        foreach (string sourceImagesDirectory in Directory.EnumerateDirectories(assetsDirectory, "sourceimages", SearchOption.AllDirectories))
+        {
+            foreach (string filePath in Directory.EnumerateFiles(sourceImagesDirectory, "*", SearchOption.AllDirectories))
+            {
+                if (!SupportedExtensions.Contains(Path.GetExtension(filePath), StringComparer.OrdinalIgnoreCase))
+                {
+                    continue;
+                }
+
+                AddHashedTextureCandidateForFile(index, assetsRoot, filePath);
+            }
+        }
+
+        return index;
+    }
+
+    private static void AddHashedTextureCandidateForFile(Dictionary<ulong, string> index, string assetsRoot, string filePath)
+    {
+        string relativePath = Path.GetRelativePath(assetsRoot, filePath);
+        string assetPath = "/" + relativePath.Replace('\\', '/');
+
+        AddHashedTextureCandidate(index, assetPath, filePath);
+
+        if (Path.GetExtension(assetPath).Equals(".ftex", StringComparison.OrdinalIgnoreCase))
+        {
+            AddHashedTextureCandidate(index, Path.ChangeExtension(assetPath, ".dds")!, filePath);
+        }
+    }
+
+    private static void AddHashedTextureCandidate(Dictionary<ulong, string> index, string assetPath, string filePath)
+    {
+        ulong hash = FoxHashing.HashFileNameWithExtension(assetPath);
+        index.TryAdd(hash, filePath);
     }
 }
 

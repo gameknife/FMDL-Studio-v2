@@ -28,8 +28,18 @@ internal sealed class FoxHashLookup
 
     public string ResolvePathHash(ulong hash)
     {
+        if (pathLookup.TryGetValue(hash, out string? value))
+        {
+            return value;
+        }
+
         ulong strippedHash = FoxHashing.StripPathCodePrefix(hash);
-        return pathLookup.TryGetValue(strippedHash, out string? value) ? value : strippedHash.ToString("x");
+        if (pathLookup.TryGetValue(strippedHash, out value))
+        {
+            return value;
+        }
+
+        return hash.ToString("x");
     }
 
     private void LoadStringDictionary(string? path)

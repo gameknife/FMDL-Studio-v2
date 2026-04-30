@@ -1,3 +1,4 @@
+using System.Buffers.Binary;
 using System.Numerics;
 using System.Text.Json;
 using System.Text.Json.Serialization;
@@ -21,6 +22,16 @@ internal sealed class SceneDiscoveryService
         "geomFile",
         "transforms",
         "colors",
+    ];
+
+    private static readonly HashSet<string> SharedGimmickContainerExcludedProperties =
+    [
+        "modelFile",
+        "geomFile",
+        "breakedModelFile",
+        "breakedGeomFile",
+        "partsFile",
+        "locaterFile",
     ];
 
     private static readonly JsonSerializerOptions JsonOptions = new()
@@ -61,7 +72,7 @@ internal sealed class SceneDiscoveryService
                     DiscoveredFrom = workItem.DiscoveredFrom,
                     DiscoveryHint = workItem.DiscoveryHint,
                     References = references,
-                    RootNodes = BuildRootNodes(fox2File.Entities, entityLookup),
+                    RootNodes = BuildRootNodes(fox2File.SourcePath, pathResolver, fox2File.Entities, entityLookup),
                     Entities = fox2File.Entities.Select(entity => BuildEntityDescription(entity, entityLookup)).ToList(),
                 };
                 files.Add(fileDescription);
@@ -253,6 +264,7 @@ internal sealed class SceneDiscoveryService
             references.Add(CreateReference(path, "embedded:string-table", pathResolver, fox2File.SourcePath));
         }
 
+        references.AddRange(DiscoverTerrainFox2References(fox2File.SourcePath, fox2File.Entities, pathResolver));
         return references.Distinct(FileReferenceDescriptionComparer.Instance).ToList();
     }
 
@@ -304,7 +316,11 @@ internal sealed class SceneDiscoveryService
         };
     }
 
-    private static List<SceneNodeDescription> BuildRootNodes(IReadOnlyList<FoxEntity> entities, IReadOnlyDictionary<ulong, FoxEntity> entityLookup)
+    private static List<SceneNodeDescription> BuildRootNodes(
+        string sourceFilePath,
+        AssetPathResolver pathResolver,
+        IReadOnlyList<FoxEntity> entities,
+        IReadOnlyDictionary<ulong, FoxEntity> entityLookup)
     {
         HashSet<ulong> candidates = new();
         Dictionary<ulong, HashSet<ulong>> childrenByParent = new();
@@ -345,7 +361,7 @@ internal sealed class SceneDiscoveryService
             }
         }
 
-        List<SceneNodeDescription> syntheticRoots = BuildSyntheticRootNodes(entities, entityLookup, syntheticChildrenByParent);
+        List<SceneNodeDescription> syntheticRoots = BuildSyntheticRootNodes(sourceFilePath, pathResolver, entities, entityLookup, syntheticChildrenByParent);
         List<SceneNodeDescription> roots = new();
         foreach (ulong rootAddress in candidates.Where(address => !parentByChild.ContainsKey(address)).OrderBy(address => address))
         {
@@ -419,11 +435,135 @@ internal sealed class SceneDiscoveryService
     }
 
     private static List<SceneNodeDescription> BuildSyntheticRootNodes(
+        string sourceFilePath,
+        AssetPathResolver pathResolver,
         IReadOnlyList<FoxEntity> entities,
         IReadOnlyDictionary<ulong, FoxEntity> entityLookup,
         Dictionary<ulong, List<SceneNodeDescription>> syntheticChildrenByParent)
     {
+        List<SceneNodeDescription> syntheticRoots = new();
         Dictionary<ulong, IReadOnlyDictionary<int, string>> instanceNamesByArrayAddress = BuildStaticModelArrayInstanceNames(entities);
+        syntheticRoots.AddRange(BuildStaticModelArrayNodes(entities, entityLookup, syntheticChildrenByParent, instanceNamesByArrayAddress));
+        syntheticRoots.AddRange(BuildSharedGimmickNodes(sourceFilePath, pathResolver, entities, entityLookup));
+        syntheticRoots.AddRange(BuildTerrainBlockNodes(entities, entityLookup));
+        return syntheticRoots;
+    }
+
+    private static List<FileReferenceDescription> DiscoverTerrainFox2References(
+        string sourceFilePath,
+        IReadOnlyList<FoxEntity> entities,
+        AssetPathResolver pathResolver)
+    {
+        List<FileReferenceDescription> references = new();
+        string? terrainDirectory = ResolveTerrainDirectoryPath(sourceFilePath, entities, pathResolver);
+        if (terrainDirectory is null || !Directory.Exists(terrainDirectory))
+        {
+            return references;
+        }
+
+        foreach (string terrainFox2Path in Directory.EnumerateFiles(terrainDirectory, "*_terrain.fox2", SearchOption.AllDirectories))
+        {
+            string displayPath = pathResolver.ToDisplayPath(terrainFox2Path);
+            references.Add(CreateReference(displayPath, "terrain:block-scan", pathResolver, sourceFilePath));
+        }
+
+        return references;
+    }
+
+    private static string? ResolveTerrainDirectoryPath(
+        string sourceFilePath,
+        IReadOnlyList<FoxEntity> entities,
+        AssetPathResolver pathResolver)
+    {
+        foreach (FoxEntity entity in entities)
+        {
+            if (!entity.ClassName.Contains("BlockControllerData", StringComparison.Ordinal))
+            {
+                continue;
+            }
+
+            string? basePath = entity.TryGetStringProperty("baseDirectoryPath") ?? entity.TryGetStringProperty("basePath");
+            if (string.IsNullOrWhiteSpace(basePath))
+            {
+                continue;
+            }
+
+            string? baseDirectoryPath = pathResolver.TryResolveToFilePath(basePath, sourceFilePath);
+            if (string.IsNullOrWhiteSpace(baseDirectoryPath))
+            {
+                continue;
+            }
+
+            string normalized = Path.GetFullPath(baseDirectoryPath);
+            normalized = normalized.Replace($"{Path.DirectorySeparatorChar}pack{Path.DirectorySeparatorChar}location{Path.DirectorySeparatorChar}",
+                $"{Path.DirectorySeparatorChar}level{Path.DirectorySeparatorChar}location{Path.DirectorySeparatorChar}",
+                StringComparison.OrdinalIgnoreCase);
+            normalized = normalized.Replace($"{Path.DirectorySeparatorChar}pack_small", $"{Path.DirectorySeparatorChar}block_small", StringComparison.OrdinalIgnoreCase);
+            normalized = normalized.Replace($"{Path.DirectorySeparatorChar}pack_large", $"{Path.DirectorySeparatorChar}block_large", StringComparison.OrdinalIgnoreCase);
+            return normalized;
+        }
+
+        return null;
+    }
+
+    private static List<SceneNodeDescription> BuildTerrainBlockNodes(
+        IReadOnlyList<FoxEntity> entities,
+        IReadOnlyDictionary<ulong, FoxEntity> entityLookup)
+    {
+        List<SceneNodeDescription> roots = new();
+        foreach (FoxEntity entity in entities)
+        {
+            if (!entity.ClassName.Equals("TerrainBlock", StringComparison.Ordinal))
+            {
+                continue;
+            }
+
+            roots.Add(new SceneNodeDescription
+            {
+                Address = FoxFormatting.FormatAddress(entity.Address),
+                ClassName = entity.ClassName,
+                Name = entity.DisplayName,
+                Transform = BuildTerrainBlockTransform(entity),
+                Properties = BuildNodeProperties(entity, entityLookup),
+            });
+        }
+
+        return roots;
+    }
+
+    private static SceneNodeTransformDescription? BuildTerrainBlockTransform(FoxEntity entity)
+    {
+        Dictionary<string, float>? pos = GetVector3(entity, "pos");
+        if (pos is null)
+        {
+            return null;
+        }
+
+        return new SceneNodeTransformDescription
+        {
+            Translation = pos,
+            RotationQuaternion = new Dictionary<string, float>(StringComparer.Ordinal)
+            {
+                ["x"] = 0.0f,
+                ["y"] = 0.0f,
+                ["z"] = 0.0f,
+                ["w"] = 1.0f,
+            },
+            Scale = new Dictionary<string, float>(StringComparer.Ordinal)
+            {
+                ["x"] = 1.0f,
+                ["y"] = 1.0f,
+                ["z"] = 1.0f,
+            },
+        };
+    }
+
+    private static List<SceneNodeDescription> BuildStaticModelArrayNodes(
+        IReadOnlyList<FoxEntity> entities,
+        IReadOnlyDictionary<ulong, FoxEntity> entityLookup,
+        Dictionary<ulong, List<SceneNodeDescription>> syntheticChildrenByParent,
+        IReadOnlyDictionary<ulong, IReadOnlyDictionary<int, string>> instanceNamesByArrayAddress)
+    {
         List<SceneNodeDescription> syntheticRoots = new();
 
         foreach (FoxEntity entity in entities)
@@ -457,6 +597,31 @@ internal sealed class SceneDiscoveryService
             }
 
             syntheticRoots.Add(arrayNode);
+        }
+
+        return syntheticRoots;
+    }
+
+    private static List<SceneNodeDescription> BuildSharedGimmickNodes(
+        string sourceFilePath,
+        AssetPathResolver pathResolver,
+        IReadOnlyList<FoxEntity> entities,
+        IReadOnlyDictionary<ulong, FoxEntity> entityLookup)
+    {
+        List<SceneNodeDescription> syntheticRoots = new();
+
+        foreach (FoxEntity entity in entities)
+        {
+            if (!entity.ClassName.Equals("TppSharedGimmickData", StringComparison.Ordinal))
+            {
+                continue;
+            }
+
+            SceneNodeDescription? gimmickNode = BuildSharedGimmickNode(sourceFilePath, pathResolver, entity, entityLookup);
+            if (gimmickNode is not null)
+            {
+                syntheticRoots.Add(gimmickNode);
+            }
         }
 
         return syntheticRoots;
@@ -560,6 +725,74 @@ internal sealed class SceneDiscoveryService
         };
     }
 
+    private static SceneNodeDescription? BuildSharedGimmickNode(
+        string sourceFilePath,
+        AssetPathResolver pathResolver,
+        FoxEntity entity,
+        IReadOnlyDictionary<ulong, FoxEntity> entityLookup)
+    {
+        string? modelFilePath = entity.TryGetStringProperty("modelFile");
+        string? locatorFilePath = entity.TryGetStringProperty("locaterFile");
+        if (string.IsNullOrWhiteSpace(modelFilePath) || string.IsNullOrWhiteSpace(locatorFilePath))
+        {
+            return null;
+        }
+
+        string? resolvedLocatorFilePath = pathResolver.TryResolveToFilePath(locatorFilePath, sourceFilePath);
+        if (resolvedLocatorFilePath is null || !File.Exists(resolvedLocatorFilePath))
+        {
+            return null;
+        }
+
+        List<LbaPlacement> placements = ReadLbaPlacements(resolvedLocatorFilePath);
+        if (placements.Count == 0)
+        {
+            return null;
+        }
+
+        List<SceneNodeDescription> children = placements
+            .Select((placement, index) => BuildSharedGimmickInstanceNode(entity, modelFilePath, entity.TryGetStringProperty("geomFile"), placement, index))
+            .ToList();
+
+        return new SceneNodeDescription
+        {
+            Address = FoxFormatting.FormatAddress(entity.Address),
+            ClassName = entity.ClassName,
+            Name = entity.DisplayName,
+            Properties = BuildNodeProperties(entity, entityLookup, SharedGimmickContainerExcludedProperties),
+            Children = children,
+        };
+    }
+
+    private static SceneNodeDescription BuildSharedGimmickInstanceNode(
+        FoxEntity entity,
+        string modelFilePath,
+        string? geomFilePath,
+        LbaPlacement placement,
+        int index)
+    {
+        Dictionary<string, object?> properties = new(StringComparer.Ordinal)
+        {
+            ["modelFile"] = modelFilePath,
+            ["sourceSharedGimmick"] = entity.DisplayName,
+            ["lbaIndex"] = index,
+        };
+
+        if (!string.IsNullOrWhiteSpace(geomFilePath))
+        {
+            properties["geomFile"] = geomFilePath;
+        }
+
+        return new SceneNodeDescription
+        {
+            Address = $"{FoxFormatting.FormatAddress(entity.Address)}:lba:{index}",
+            ClassName = $"{entity.ClassName}Instance",
+            Name = $"{entity.DisplayName}_{index:D4}",
+            Transform = placement.Transform,
+            Properties = properties,
+        };
+    }
+
     private static List<FoxMatrixValue> GetMatrixListProperty(FoxEntity entity, string propertyName)
     {
         if (entity.FindProperty(propertyName) is not FoxProperty property)
@@ -620,6 +853,48 @@ internal sealed class SceneDiscoveryService
                 ["z"] = scale.Z,
             },
         };
+    }
+
+    private static List<LbaPlacement> ReadLbaPlacements(string path)
+    {
+        byte[] data = File.ReadAllBytes(path);
+        if (data.Length < 16)
+        {
+            return [];
+        }
+
+        uint count = BinaryPrimitives.ReadUInt32LittleEndian(data.AsSpan(0, 4));
+        int requiredLength = checked(16 + (int)count * 32);
+        if (count == 0 || data.Length < requiredLength)
+        {
+            return [];
+        }
+
+        List<LbaPlacement> placements = new((int)count);
+        for (int index = 0; index < count; index++)
+        {
+            int offset = 16 + index * 32;
+            SceneNodeTransformDescription transform = new()
+            {
+                Translation = new Dictionary<string, float>
+                {
+                    ["x"] = BitConverter.ToSingle(data, offset),
+                    ["y"] = BitConverter.ToSingle(data, offset + 4),
+                    ["z"] = BitConverter.ToSingle(data, offset + 8),
+                },
+                RotationQuaternion = new Dictionary<string, float>
+                {
+                    ["x"] = BitConverter.ToSingle(data, offset + 16),
+                    ["y"] = BitConverter.ToSingle(data, offset + 20),
+                    ["z"] = BitConverter.ToSingle(data, offset + 24),
+                    ["w"] = BitConverter.ToSingle(data, offset + 28),
+                },
+            };
+
+            placements.Add(new LbaPlacement(index, transform));
+        }
+
+        return placements;
     }
 
     private static ulong? TryGetLinkedEntityAddress(FoxEntity entity, string propertyName)
@@ -779,9 +1054,11 @@ internal sealed class SceneDiscoveryService
 
         return new CompactSceneNodeDescription
         {
+            ClassName = node.ClassName,
             Name = node.Name,
             Transform = node.Transform,
             FmdlPaths = fmdlPaths.Count == 0 ? null : fmdlPaths,
+            Properties = node.Properties is { Count: > 0 } ? node.Properties : null,
             Children = children is { Count: > 0 } ? children : null,
         };
     }
@@ -1065,8 +1342,12 @@ internal sealed class CompactSceneFileDescription
 
 internal sealed class CompactSceneNodeDescription
 {
+    public string? ClassName { get; init; }
     public string? Name { get; init; }
     public SceneNodeTransformDescription? Transform { get; init; }
     public List<string>? FmdlPaths { get; init; }
+    public Dictionary<string, object?>? Properties { get; init; }
     public List<CompactSceneNodeDescription>? Children { get; init; }
 }
+
+internal sealed record LbaPlacement(int Index, SceneNodeTransformDescription Transform);
