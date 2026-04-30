@@ -416,7 +416,7 @@ internal sealed class SceneComposer
         List<(int NewNodeIndex, int OldSkinIndex)> skinnedNodes = new();
         List<int> newRootNodes = new();
 
-        foreach (int oldRootIndex in template.SourceRootNodes)
+        foreach (int oldRootIndex in EnumerateAttachableRootNodes(template))
         {
             newRootNodes.Add(CloneModelNode(template, oldRootIndex, nodeMap, skinnedNodes));
         }
@@ -445,6 +445,66 @@ internal sealed class SceneComposer
         {
             AddChild(scene.Nodes[parentNodeIndex], newRootNode);
         }
+    }
+
+    private static IEnumerable<int> EnumerateAttachableRootNodes(ImportedModelTemplate template)
+    {
+        foreach (int rootNodeIndex in template.SourceRootNodes)
+        {
+            GltfNode rootNode = template.Source.Nodes[rootNodeIndex];
+            if (IsRedundantImportedRoot(rootNode))
+            {
+                foreach (int childIndex in rootNode.Children!)
+                {
+                    yield return childIndex;
+                }
+
+                continue;
+            }
+
+            yield return rootNodeIndex;
+        }
+    }
+
+    private static bool IsRedundantImportedRoot(GltfNode node)
+    {
+        return node.Mesh is null &&
+               node.Skin is null &&
+               node.Children is { Count: > 0 } &&
+               !HasMeaningfulExtras(node.Extras) &&
+               HasIdentityTransform(node);
+    }
+
+    private static bool HasMeaningfulExtras(Dictionary<string, object?>? extras)
+    {
+        return extras is { Count: > 0 };
+    }
+
+    private static bool HasIdentityTransform(GltfNode node)
+    {
+        return IsIdentityTranslation(node.Translation) &&
+               IsIdentityRotation(node.Rotation) &&
+               IsIdentityScale(node.Scale);
+    }
+
+    private static bool IsIdentityTranslation(float[]? translation)
+    {
+        return translation is null || (translation.Length == 3 && IsApproximately(translation[0], 0.0f) && IsApproximately(translation[1], 0.0f) && IsApproximately(translation[2], 0.0f));
+    }
+
+    private static bool IsIdentityRotation(float[]? rotation)
+    {
+        return rotation is null || (rotation.Length == 4 && IsApproximately(rotation[0], 0.0f) && IsApproximately(rotation[1], 0.0f) && IsApproximately(rotation[2], 0.0f) && IsApproximately(rotation[3], 1.0f));
+    }
+
+    private static bool IsIdentityScale(float[]? scale)
+    {
+        return scale is null || (scale.Length == 3 && IsApproximately(scale[0], 1.0f) && IsApproximately(scale[1], 1.0f) && IsApproximately(scale[2], 1.0f));
+    }
+
+    private static bool IsApproximately(float left, float right)
+    {
+        return Math.Abs(left - right) <= 1e-6f;
     }
 
     private int CloneModelNode(

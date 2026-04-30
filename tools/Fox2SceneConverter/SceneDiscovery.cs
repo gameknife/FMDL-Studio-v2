@@ -1,3 +1,4 @@
+using System.Numerics;
 using System.Text.Json;
 using System.Text.Json.Serialization;
 
@@ -5,6 +6,23 @@ namespace Fox2SceneConverter;
 
 internal sealed class SceneDiscoveryService
 {
+    private static readonly HashSet<string> StructuralNodePropertyNames =
+    [
+        "parent",
+        "children",
+        "transform",
+        "shearTransform",
+        "pivotTransform",
+    ];
+
+    private static readonly HashSet<string> StaticModelArrayContainerExcludedProperties =
+    [
+        "modelFile",
+        "geomFile",
+        "transforms",
+        "colors",
+    ];
+
     private static readonly JsonSerializerOptions JsonOptions = new()
     {
         DefaultIgnoreCondition = JsonIgnoreCondition.WhenWritingNull,
@@ -291,6 +309,7 @@ internal sealed class SceneDiscoveryService
         HashSet<ulong> candidates = new();
         Dictionary<ulong, HashSet<ulong>> childrenByParent = new();
         Dictionary<ulong, ulong> parentByChild = new();
+        Dictionary<ulong, List<SceneNodeDescription>> syntheticChildrenByParent = new();
 
         foreach (FoxEntity entity in entities)
         {
@@ -326,6 +345,7 @@ internal sealed class SceneDiscoveryService
             }
         }
 
+        List<SceneNodeDescription> syntheticRoots = BuildSyntheticRootNodes(entities, entityLookup, syntheticChildrenByParent);
         List<SceneNodeDescription> roots = new();
         foreach (ulong rootAddress in candidates.Where(address => !parentByChild.ContainsKey(address)).OrderBy(address => address))
         {
@@ -334,9 +354,10 @@ internal sealed class SceneDiscoveryService
                 continue;
             }
 
-            roots.Add(BuildNode(entity, entityLookup, childrenByParent, new HashSet<ulong>()));
+            roots.Add(BuildNode(entity, entityLookup, childrenByParent, syntheticChildrenByParent, new HashSet<ulong>()));
         }
 
+        roots.AddRange(syntheticRoots.OrderBy(node => node.Name, StringComparer.OrdinalIgnoreCase).ThenBy(node => node.Address, StringComparer.Ordinal));
         return roots;
 
         HashSet<ulong> GetChildren(ulong parentAddress)
@@ -355,6 +376,7 @@ internal sealed class SceneDiscoveryService
         FoxEntity entity,
         IReadOnlyDictionary<ulong, FoxEntity> entityLookup,
         IReadOnlyDictionary<ulong, HashSet<ulong>> childrenByParent,
+        IReadOnlyDictionary<ulong, List<SceneNodeDescription>> syntheticChildrenByParent,
         HashSet<ulong> recursionGuard)
     {
         if (!recursionGuard.Add(entity.Address))
@@ -373,8 +395,14 @@ internal sealed class SceneDiscoveryService
             children = childAddresses
                 .OrderBy(address => address)
                 .Where(entityLookup.ContainsKey)
-                .Select(address => BuildNode(entityLookup[address], entityLookup, childrenByParent, recursionGuard))
+                .Select(address => BuildNode(entityLookup[address], entityLookup, childrenByParent, syntheticChildrenByParent, recursionGuard))
                 .ToList();
+        }
+
+        if (syntheticChildrenByParent.TryGetValue(entity.Address, out List<SceneNodeDescription>? syntheticChildren))
+        {
+            children ??= new List<SceneNodeDescription>();
+            children.AddRange(syntheticChildren);
         }
 
         recursionGuard.Remove(entity.Address);
@@ -387,6 +415,244 @@ internal sealed class SceneDiscoveryService
             Transform = BuildTransform(entity, entityLookup),
             Properties = BuildNodeProperties(entity, entityLookup),
             Children = children,
+        };
+    }
+
+    private static List<SceneNodeDescription> BuildSyntheticRootNodes(
+        IReadOnlyList<FoxEntity> entities,
+        IReadOnlyDictionary<ulong, FoxEntity> entityLookup,
+        Dictionary<ulong, List<SceneNodeDescription>> syntheticChildrenByParent)
+    {
+        Dictionary<ulong, IReadOnlyDictionary<int, string>> instanceNamesByArrayAddress = BuildStaticModelArrayInstanceNames(entities);
+        List<SceneNodeDescription> syntheticRoots = new();
+
+        foreach (FoxEntity entity in entities)
+        {
+            if (!entity.ClassName.Equals("StaticModelArray", StringComparison.Ordinal))
+            {
+                continue;
+            }
+
+            SceneNodeDescription? arrayNode = BuildStaticModelArrayNode(
+                entity,
+                entityLookup,
+                instanceNamesByArrayAddress.GetValueOrDefault(entity.Address));
+
+            if (arrayNode is null)
+            {
+                continue;
+            }
+
+            ulong? parentAddress = TryGetLinkedEntityAddress(entity, "parentLocator");
+            if (parentAddress is ulong resolvedParentAddress && entityLookup.ContainsKey(resolvedParentAddress))
+            {
+                if (!syntheticChildrenByParent.TryGetValue(resolvedParentAddress, out List<SceneNodeDescription>? children))
+                {
+                    children = new List<SceneNodeDescription>();
+                    syntheticChildrenByParent.Add(resolvedParentAddress, children);
+                }
+
+                children.Add(arrayNode);
+                continue;
+            }
+
+            syntheticRoots.Add(arrayNode);
+        }
+
+        return syntheticRoots;
+    }
+
+    private static Dictionary<ulong, IReadOnlyDictionary<int, string>> BuildStaticModelArrayInstanceNames(IReadOnlyList<FoxEntity> entities)
+    {
+        Dictionary<ulong, Dictionary<int, string>> namesByArrayAddress = new();
+
+        foreach (FoxEntity entity in entities)
+        {
+            if (!entity.ClassName.Equals("StaticModelArrayLinkTarget", StringComparison.Ordinal))
+            {
+                continue;
+            }
+
+            ulong? arrayAddress = entity.TryGetEntityReference("staticModelArray");
+            int? arrayIndex = TryGetIntProperty(entity, "arrayIndex");
+            if (arrayAddress is null || arrayIndex is null)
+            {
+                continue;
+            }
+
+            if (!namesByArrayAddress.TryGetValue(arrayAddress.Value, out Dictionary<int, string>? namesByIndex))
+            {
+                namesByIndex = new Dictionary<int, string>();
+                namesByArrayAddress.Add(arrayAddress.Value, namesByIndex);
+            }
+
+            namesByIndex[arrayIndex.Value] = entity.DisplayName;
+        }
+
+        return namesByArrayAddress.ToDictionary(
+            pair => pair.Key,
+            pair => (IReadOnlyDictionary<int, string>)pair.Value,
+            EqualityComparer<ulong>.Default);
+    }
+
+    private static SceneNodeDescription? BuildStaticModelArrayNode(
+        FoxEntity entity,
+        IReadOnlyDictionary<ulong, FoxEntity> entityLookup,
+        IReadOnlyDictionary<int, string>? instanceNames)
+    {
+        string? modelFilePath = entity.TryGetStringProperty("modelFile");
+        List<SceneNodeDescription> instanceNodes = GetMatrixListProperty(entity, "transforms")
+            .Select((matrix, index) => BuildStaticModelArrayInstanceNode(entity, modelFilePath, entity.TryGetStringProperty("geomFile"), matrix, index, instanceNames))
+            .Where(node => node is not null)
+            .Cast<SceneNodeDescription>()
+            .ToList();
+
+        if (instanceNodes.Count == 0)
+        {
+            return null;
+        }
+
+        return new SceneNodeDescription
+        {
+            Address = FoxFormatting.FormatAddress(entity.Address),
+            ClassName = entity.ClassName,
+            Name = entity.DisplayName,
+            Properties = BuildNodeProperties(entity, entityLookup, StaticModelArrayContainerExcludedProperties),
+            Children = instanceNodes,
+        };
+    }
+
+    private static SceneNodeDescription? BuildStaticModelArrayInstanceNode(
+        FoxEntity entity,
+        string? modelFilePath,
+        string? geomFilePath,
+        FoxMatrixValue matrix,
+        int index,
+        IReadOnlyDictionary<int, string>? instanceNames)
+    {
+        SceneNodeTransformDescription? transform = BuildTransformFromMatrix(matrix);
+        if (transform is null)
+        {
+            return null;
+        }
+
+        Dictionary<string, object?> properties = new(StringComparer.Ordinal);
+        if (!string.IsNullOrWhiteSpace(modelFilePath))
+        {
+            properties["modelFile"] = modelFilePath;
+        }
+
+        if (!string.IsNullOrWhiteSpace(geomFilePath))
+        {
+            properties["geomFile"] = geomFilePath;
+        }
+
+        properties["arrayIndex"] = index;
+        properties["sourceStaticModelArray"] = entity.DisplayName;
+
+        return new SceneNodeDescription
+        {
+            Address = $"{FoxFormatting.FormatAddress(entity.Address)}:instance:{index}",
+            ClassName = $"{entity.ClassName}Instance",
+            Name = instanceNames?.GetValueOrDefault(index) ?? $"{entity.DisplayName}_{index:D4}",
+            Transform = transform,
+            Properties = properties,
+        };
+    }
+
+    private static List<FoxMatrixValue> GetMatrixListProperty(FoxEntity entity, string propertyName)
+    {
+        if (entity.FindProperty(propertyName) is not FoxProperty property)
+        {
+            return [];
+        }
+
+        return property.Value switch
+        {
+            FoxListValue listValue => listValue.Items.OfType<FoxMatrixValue>().Where(value => value.Values.Count == 16).ToList(),
+            FoxSingleValue { Value: FoxMatrixValue matrixValue } when matrixValue.Values.Count == 16 => [matrixValue],
+            _ => [],
+        };
+    }
+
+    private static SceneNodeTransformDescription? BuildTransformFromMatrix(FoxMatrixValue matrix)
+    {
+        if (matrix.Values.Count != 16)
+        {
+            return null;
+        }
+
+        Matrix4x4 sourceMatrix = new(
+            matrix.Values[0], matrix.Values[1], matrix.Values[2], matrix.Values[3],
+            matrix.Values[4], matrix.Values[5], matrix.Values[6], matrix.Values[7],
+            matrix.Values[8], matrix.Values[9], matrix.Values[10], matrix.Values[11],
+            matrix.Values[12], matrix.Values[13], matrix.Values[14], matrix.Values[15]);
+
+        Vector3 translation = new(sourceMatrix.M41, sourceMatrix.M42, sourceMatrix.M43);
+        Quaternion rotation = Quaternion.Identity;
+        Vector3 scale = Vector3.One;
+
+        if (!Matrix4x4.Decompose(sourceMatrix, out scale, out rotation, out translation))
+        {
+            rotation = Quaternion.Identity;
+            scale = Vector3.One;
+        }
+
+        return new SceneNodeTransformDescription
+        {
+            Translation = new Dictionary<string, float>
+            {
+                ["x"] = translation.X,
+                ["y"] = translation.Y,
+                ["z"] = translation.Z,
+            },
+            RotationQuaternion = new Dictionary<string, float>
+            {
+                ["x"] = rotation.X,
+                ["y"] = rotation.Y,
+                ["z"] = rotation.Z,
+                ["w"] = rotation.W,
+            },
+            Scale = new Dictionary<string, float>
+            {
+                ["x"] = scale.X,
+                ["y"] = scale.Y,
+                ["z"] = scale.Z,
+            },
+        };
+    }
+
+    private static ulong? TryGetLinkedEntityAddress(FoxEntity entity, string propertyName)
+    {
+        if (entity.FindProperty(propertyName) is not FoxProperty property)
+        {
+            return null;
+        }
+
+        return property.Value switch
+        {
+            FoxSingleValue { Value: FoxEntityReferenceValue entityReference } when entityReference.Address != 0 => entityReference.Address,
+            FoxSingleValue { Value: FoxEntityLinkValue entityLink } when entityLink.Address != 0 => entityLink.Address,
+            _ => null,
+        };
+    }
+
+    private static int? TryGetIntProperty(FoxEntity entity, string propertyName)
+    {
+        if (entity.FindProperty(propertyName) is not FoxProperty property)
+        {
+            return null;
+        }
+
+        return property.Value switch
+        {
+            FoxSingleValue { Value: FoxScalarValue { Value: sbyte value } } => value,
+            FoxSingleValue { Value: FoxScalarValue { Value: byte value } } => value,
+            FoxSingleValue { Value: FoxScalarValue { Value: short value } } => value,
+            FoxSingleValue { Value: FoxScalarValue { Value: ushort value } } => value,
+            FoxSingleValue { Value: FoxScalarValue { Value: int value } } => value,
+            FoxSingleValue { Value: FoxScalarValue { Value: uint value } } when value <= int.MaxValue => (int)value,
+            _ => null,
         };
     }
 
@@ -431,12 +697,16 @@ internal sealed class SceneDiscoveryService
         return transform;
     }
 
-    private static Dictionary<string, object?>? BuildNodeProperties(FoxEntity entity, IReadOnlyDictionary<ulong, FoxEntity> entityLookup)
+    private static Dictionary<string, object?>? BuildNodeProperties(
+        FoxEntity entity,
+        IReadOnlyDictionary<ulong, FoxEntity> entityLookup,
+        IReadOnlySet<string>? excludedProperties = null)
     {
         Dictionary<string, object?> properties = new(StringComparer.Ordinal);
         foreach (FoxProperty property in entity.Properties)
         {
-            if (property.Name is "parent" or "children" or "transform" or "shearTransform" or "pivotTransform")
+            if (StructuralNodePropertyNames.Contains(property.Name) ||
+                (excludedProperties is not null && excludedProperties.Contains(property.Name)))
             {
                 continue;
             }
