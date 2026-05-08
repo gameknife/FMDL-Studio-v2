@@ -309,6 +309,7 @@ button:active,
 }
 
 .viewport-toolbar button,
+#selectedNodeLabel,
 #renderProbe {
   min-width: 72px;
   height: 36px;
@@ -318,6 +319,7 @@ button:active,
   backdrop-filter: blur(10px);
 }
 
+#selectedNodeLabel,
 #renderProbe {
   display: inline-flex;
   align-items: center;
@@ -328,6 +330,13 @@ button:active,
   font-size: 12px;
   font-weight: 760;
   white-space: nowrap;
+}
+
+#selectedNodeLabel {
+  min-width: 0;
+  max-width: min(36vw, 420px);
+  overflow: hidden;
+  text-overflow: ellipsis;
 }
 
 .drop-overlay {
@@ -393,6 +402,7 @@ button:active,
     height: 34px;
   }
 
+  #selectedNodeLabel,
   #renderProbe {
     min-width: 0;
     max-width: 168px;

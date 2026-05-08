@@ -157,6 +157,7 @@ internal sealed class ScenePackageBuilder
 
         if (options.DisableNameFallback ||
             string.IsNullOrWhiteSpace(node.Name) ||
+            !CanUseNameFallback(node) ||
             ShouldSuppressNameFallback(node.Name!))
         {
             return [];
@@ -165,6 +166,24 @@ internal sealed class ScenePackageBuilder
         IReadOnlyList<string> fileModels = fileModelsByPath.GetValueOrDefault(file.Path, []);
         string? match = GuessModelFromName(node.Name!, fileModels);
         return match is null ? [] : [new ResolvedModelBinding(match, "nameFallback")];
+    }
+
+    private static bool CanUseNameFallback(CompactSceneNode node)
+    {
+        if (string.IsNullOrWhiteSpace(node.ClassName) ||
+            node.Properties is null)
+        {
+            return false;
+        }
+
+        bool looksLikeStaticModel = node.ClassName.Contains("StaticModel", StringComparison.Ordinal);
+        if (!looksLikeStaticModel)
+        {
+            return false;
+        }
+
+        return node.Properties.ContainsKey("modelFile") ||
+               node.Properties.ContainsKey("geomFile");
     }
 
     private string? GuessModelFromName(string nodeName, IReadOnlyList<string> fileModels)

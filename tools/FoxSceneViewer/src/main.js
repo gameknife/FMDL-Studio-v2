@@ -18,6 +18,7 @@ const unloadAllLayersButton = document.querySelector("#unloadAllLayersButton");
 const logList = document.querySelector("#logList");
 const frameButton = document.querySelector("#frameButton");
 const resetButton = document.querySelector("#resetButton");
+const selectedNodeLabel = document.querySelector("#selectedNodeLabel");
 const renderProbe = document.querySelector("#renderProbe");
 
 const renderer = new THREE.WebGLRenderer({ canvas, antialias: true, preserveDrawingBuffer: true });
@@ -58,6 +59,7 @@ fillLight.position.set(-10, 5, -8);
 scene.add(fillLight);
 
 const loader = new GLTFLoader();
+const raycaster = new THREE.Raycaster();
 const LargeSceneAutoLoadAssetLimit = 300;
 const LayerBatchAssetLimit = 260;
 const AssetLoadConcurrency = 2;
@@ -68,6 +70,9 @@ let layerRows = [];
 let activeSceneLabel = "";
 let unsupportedTransformCount = 0;
 let lastRenderProbeTime = 0;
+let selectedNodeObject = null;
+let selectionHelper = null;
+let pointerDownPosition = null;
 
 function resize() {
   const rect = viewport.getBoundingClientRect();
@@ -102,6 +107,7 @@ function log(message, level = "info") {
 
 function clearScene() {
   disposeAssetCache();
+  clearSelection();
   rootGroup.clear();
   assetCache = new Map();
   layerGroups = new Map();
@@ -438,6 +444,10 @@ function unloadLayer(layerId, shouldFrame = true) {
     return;
   }
 
+  if (selectedNodeObject && state.group?.getObjectById(selectedNodeObject.id)) {
+    clearSelection();
+  }
+
   if (state.group) {
     rootGroup.remove(state.group);
     state.group.clear();
@@ -464,6 +474,7 @@ function unloadAllLayers() {
   }
 
   disposeAssetCache();
+  clearSelection();
   setStatus("Ready", 100);
   frameScene();
 }
@@ -739,11 +750,25 @@ function applyLayerFilter() {
 }
 
 function frameScene() {
-  const box = new THREE.Box3().setFromObject(rootGroup);
+  frameObject(rootGroup, { fallbackToDefault: true });
+}
+
+function resetCamera() {
+  camera.position.set(8, 6, 8);
+  controls.target.set(0, 1, 0);
+  camera.near = 0.05;
+  camera.far = 100000;
+  camera.updateProjectionMatrix();
+  controls.update();
+}
+
+function frameObject(object, options = {}) {
+  const { fallbackToDefault = false } = options;
+  const box = new THREE.Box3().setFromObject(object);
   if (box.isEmpty()) {
-    camera.position.set(8, 6, 8);
-    controls.target.set(0, 1, 0);
-    controls.update();
+    if (fallbackToDefault) {
+      resetCamera();
+    }
     return;
   }
 
@@ -765,13 +790,73 @@ function frameScene() {
   controls.update();
 }
 
-function resetCamera() {
-  camera.position.set(8, 6, 8);
-  controls.target.set(0, 1, 0);
-  camera.near = 0.05;
-  camera.far = 100000;
-  camera.updateProjectionMatrix();
-  controls.update();
+function pickNodeObject(event) {
+  const rect = renderer.domElement.getBoundingClientRect();
+  if (rect.width <= 0 || rect.height <= 0) {
+    return null;
+  }
+
+  const pointer = new THREE.Vector2(
+    ((event.clientX - rect.left) / rect.width) * 2 - 1,
+    -((event.clientY - rect.top) / rect.height) * 2 + 1,
+  );
+
+  raycaster.setFromCamera(pointer, camera);
+  const intersections = raycaster.intersectObject(rootGroup, true);
+  for (const hit of intersections) {
+    const nodeObject = findAncestorNodeObject(hit.object);
+    if (nodeObject) {
+      return nodeObject;
+    }
+  }
+
+  return null;
+}
+
+function findAncestorNodeObject(object) {
+  let current = object;
+  while (current) {
+    if (current.userData?.nodeId) {
+      return current;
+    }
+    current = current.parent;
+  }
+
+  return null;
+}
+
+function selectNodeObject(object) {
+  selectedNodeObject = object;
+  updateSelectionHelper();
+}
+
+function clearSelection() {
+  selectedNodeObject = null;
+  updateSelectionHelper();
+}
+
+function updateSelectionHelper() {
+  if (selectionHelper) {
+    scene.remove(selectionHelper);
+    selectionHelper = null;
+  }
+
+  if (!selectedNodeObject) {
+    selectedNodeLabel.textContent = "No selection";
+    selectedNodeLabel.title = "";
+    return;
+  }
+
+  selectedNodeLabel.textContent = selectedNodeObject.name || selectedNodeObject.userData?.nodeId || "Unnamed node";
+  selectedNodeLabel.title = selectedNodeLabel.textContent;
+
+  const box = new THREE.Box3().setFromObject(selectedNodeObject);
+  if (box.isEmpty()) {
+    return;
+  }
+
+  selectionHelper = new THREE.Box3Helper(box, 0xffb347);
+  scene.add(selectionHelper);
 }
 
 function updateRenderProbe() {
@@ -861,6 +946,34 @@ loadVisibleLayersButton.addEventListener("click", async () => {
   }
 });
 unloadAllLayersButton.addEventListener("click", unloadAllLayers);
+canvas.addEventListener("pointerdown", (event) => {
+  pointerDownPosition = { x: event.clientX, y: event.clientY };
+});
+canvas.addEventListener("pointerup", (event) => {
+  if (!pointerDownPosition) {
+    return;
+  }
+
+  const movedDistance = Math.hypot(event.clientX - pointerDownPosition.x, event.clientY - pointerDownPosition.y);
+  pointerDownPosition = null;
+  if (movedDistance > 5) {
+    return;
+  }
+
+  const nodeObject = pickNodeObject(event);
+  if (nodeObject) {
+    selectNodeObject(nodeObject);
+  } else {
+    clearSelection();
+  }
+});
+canvas.addEventListener("dblclick", (event) => {
+  const nodeObject = pickNodeObject(event);
+  if (nodeObject) {
+    selectNodeObject(nodeObject);
+    frameObject(nodeObject);
+  }
+});
 
 viewport.addEventListener("dragover", (event) => {
   event.preventDefault();

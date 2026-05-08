@@ -26,6 +26,8 @@ For huge scenes, the viewer loads the manifest first and only materializes layer
 - `layers=<name-or-id-substring>` to auto-load one area.
 - the layer filter plus `Load` button to load a bounded batch.
 
+Once a layer is loaded, clicking a node in the viewport shows its bounding box and name, and double-clicking a node frames it.
+
 Example for an exported AFGH package served from `D:\`:
 
 ```powershell
