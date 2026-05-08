@@ -1,0 +1,114 @@
+{
+  "schema": "https://fmdl.studio/schemas/foxscene-1.json",
+  "version": 1,
+  "generator": "FMDL Studio v2 sample",
+  "source": {
+    "compactScene": "sample",
+    "fox2File": "sample.fox2",
+    "fox2AssetPath": "/Assets/sample/sample.fox2"
+  },
+  "coordinateSystem": {
+    "upAxis": "Y",
+    "transformConvention": "glTF TRS passthrough; node transforms match the compact FOX2 scene and exported model GLBs."
+  },
+  "summary": {
+    "layerCount": 2,
+    "nodeCount": 5,
+    "assetCount": 1,
+    "placedAssetCount": 1,
+    "placementCount": 3,
+    "warningCount": 0
+  },
+  "assets": [
+    {
+      "id": "fmdl-samplebox",
+      "kind": "model/gltf-binary",
+      "name": "sample_box",
+      "sourceFmdl": "/Assets/sample/sample_box.fmdl",
+      "uri": "https://raw.githubusercontent.com/KhronosGroup/glTF-Sample-Models/master/2.0/Box/glTF-Binary/Box.glb",
+      "placementCount": 3
+    }
+  ],
+  "layers": [
+    {
+      "id": "layer-main",
+      "name": "sample_main",
+      "sourceFox2": "/Assets/sample/sample_main.fox2",
+      "rootNodes": ["node-000000"]
+    },
+    {
+      "id": "layer-props",
+      "name": "sample_props",
+      "sourceFox2": "/Assets/sample/sample_props.fox2",
+      "rootNodes": ["node-000003"]
+    }
+  ],
+  "rootNodes": ["node-000000", "node-000003"],
+  "nodes": [
+    {
+      "id": "node-000000",
+      "layerId": "layer-main",
+      "name": "MainRoot",
+      "className": "DataSet",
+      "children": ["node-000001", "node-000002"]
+    },
+    {
+      "id": "node-000001",
+      "layerId": "layer-main",
+      "name": "Box_A",
+      "className": "StaticModel",
+      "transform": {
+        "translation": [-1.4, 0, 0],
+        "rotation": [0, 0, 0, 1],
+        "scale": [1, 1, 1]
+      },
+      "assets": [
+        {
+          "assetId": "fmdl-samplebox",
+          "source": "direct"
+        }
+      ]
+    },
+    {
+      "id": "node-000002",
+      "layerId": "layer-main",
+      "name": "Box_B",
+      "className": "StaticModel",
+      "transform": {
+        "translation": [1.4, 0, 0],
+        "rotation": [0, 0.3826834, 0, 0.9238795],
+        "scale": [0.8, 1.6, 0.8]
+      },
+      "assets": [
+        {
+          "assetId": "fmdl-samplebox",
+          "source": "direct"
+        }
+      ]
+    },
+    {
+      "id": "node-000003",
+      "layerId": "layer-props",
+      "name": "PropsRoot",
+      "className": "DataSet",
+      "children": ["node-000004"]
+    },
+    {
+      "id": "node-000004",
+      "layerId": "layer-props",
+      "name": "Box_C",
+      "className": "StaticModel",
+      "transform": {
+        "translation": [0, 1.25, -1.8],
+        "rotation": [0.2391176, 0.3696438, 0.0990458, 0.8923991],
+        "scale": [0.7, 0.7, 0.7]
+      },
+      "assets": [
+        {
+          "assetId": "fmdl-samplebox",
+          "source": "nameFallback"
+        }
+      ]
+    }
+  ]
+}

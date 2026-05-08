@@ -12,9 +12,9 @@ It is intended as a handoff document for future sessions.
 
 ## Current toolchain
 
-The scene pipeline is:
+The legacy merged-scene pipeline is:
 
-1. `tools\Fox2SceneConverter`  
+1. `tools\Fox2SceneConverter`
    Reads a `.fox2` scene and writes:
    - `<scene>.scene.json`
    - `<scene>.scene.compact.json`
@@ -24,6 +24,19 @@ The scene pipeline is:
 
 3. `tools\FmdlGltfConverter`  
    Used indirectly by `SceneGltfComposer` to convert referenced FMDLs into cached per-model GLBs.
+
+The newer portable-scene pipeline is:
+
+1. `tools\Fox2SceneConverter`
+   Reads a `.fox2` scene and writes `<scene>.scene.compact.json`.
+
+2. `tools\FoxScenePackager`
+   Reads the compact scene and writes:
+   - `<scene>.foxscene.json`
+   - `<scene>.models\Assets\...\*.glb`
+
+3. `tools\FoxSceneViewer` or another runtime
+   Reads the foxscene JSON and instantiates independent GLBs from the asset manifest.
 
 Validated command pattern:
 
@@ -36,6 +49,66 @@ dotnet .\tools\SceneGltfComposer\bin\Release\net8.0\SceneGltfComposer.dll `
   'D:\BOTW\MGSV\EXPORTED\Assets\tpp\level\location\cypr\cypr_stage.scene.compact.json' `
   --asset-root 'D:\BOTW\MGSV\EXPORTED'
 ```
+
+Portable scene command pattern:
+
+```powershell
+dotnet .\tools\FoxScenePackager\bin\Release\net8.0\FoxScenePackager.dll `
+  'D:\BOTW\MGSV\EXPORTED\Assets\tpp\level\location\cypr\cypr_stage.scene.compact.json' `
+  'D:\BOTW\MGSV\EXPORTED\Assets\tpp\level\location\cypr\cypr_stage.foxscene.json' `
+  --asset-root 'D:\BOTW\MGSV\EXPORTED'
+```
+
+Profiling findings from `mbqf_stage`:
+
+- FOX2 discovery / compact scene generation: about `2.6s`
+- foxscene manifest generation without model conversion: about `2.3s`
+- cached package rewrite with 190 existing GLBs: about `2.35s`
+- textured model rebuild, old serial conversion: about `355s`
+- textured model rebuild with `FoxScenePackager --jobs 4`: about `143.83s`
+- textured model rebuild with `--jobs 4 --texture-cache-dir <path>` before hashed-index persistence:
+  - cold shared PNG cache: about `98.12s`
+  - warm shared PNG cache: about `82.39s`
+- textured model rebuild with `--jobs 4 --texture-cache-dir <path>` after hashed-index persistence:
+  - cold shared PNG cache: about `53.71s`
+  - warm shared PNG cache: about `29.57s`
+  - cache contents after MBQF: `498` PNG files, about `84.61MiB`, plus one hashed texture index file
+- textured model rebuild with `--jobs 4 --texture-cache-dir <path> --texture-format webp-lossy --webp-quality 90 --webp-method 0`:
+  - cold shared WebP cache: about `48.42s`
+  - model GLBs total: `46,386,180` bytes, down from `261,084,160` bytes with PNG
+  - cache contents after MBQF: `498` WebP files plus one hashed texture index file, about `17.22MiB`
+- geometry-only model rebuild with `--jobs 4 --no-model-textures`: about `25.5s`
+
+The dominant cost is texture transcoding and PNG embedding inside FMDL -> GLB conversion. In the largest MBQF model, parse time was about `15ms`; textured export was about `10.4s`; geometry-only export was about `0.11s`.
+
+Detailed texture profiling on
+`Assets\tpp\environ\object\mother_base\hospital\mtbs_hspt001\scenes\mtbs_hspt001_room003.fmdl`
+shows the current bottleneck more precisely:
+
+| Mode | Wall time | Output size | Texture rows | Texture-stage total | PNG encode | Notes |
+| --- | ---: | ---: | ---: | ---: | ---: | --- |
+| default PNG | `10.58s` | `18,392,708` bytes | `75` | `7.25s` | `6.35s` | encode dominates |
+| `--fast-png` | `5.86s` | `21,893,656` bytes | `75` | `2.42s` | `1.35s` | about `19%` larger |
+| `--texture-format webp-lossless --webp-method 0` | `11.70s` | `11,988,432` bytes | `75` | `9.10s` | `8.31s` | smaller but slower |
+| `--texture-format webp-lossy --webp-quality 90 --webp-method 0` | `5.65s` | `2,511,980` bytes | `75` | `3.03s` | `2.19s` | chosen scene default |
+| `--texture-format webp-lossy --webp-quality 85 --webp-method 0` | `5.23s` | `1,781,900` bytes | `75` | `2.66s` | `1.82s` | smaller, more quality risk |
+| cold `--texture-cache-dir` | `11.91s` | `18,392,708` bytes | `75` | `8.31s` | `6.91s` | includes cache write |
+| warm `--texture-cache-dir` | `3.33s` | `18,392,708` bytes | `75` | `0.02s` | `0s` | all texture payloads loaded from cache |
+| warm PNG cache + warm hash index | `0.76s` | `18,392,708` bytes | `75` | `0.02s` | `0s` | path resolution falls to about `0.13s` |
+
+For the default PNG run on that model, the non-encode texture costs were small by comparison:
+`FTEX -> DDS` read/dechunk was about `0.25s`, DDS load/decode about `0.14s`,
+RGBA conversion about `0.12s`, and Fox usage transforms about `0.24s`.
+
+The warm-cache profile exposed a second texture-side cost: before the hashed texture index was persisted, each converter process could spend seconds scanning `Assets/**/sourceimages` to resolve hash-style texture references such as `1569c9906a24dc8f.dds`. The current resolver now checks hash-style references before broad candidate expansion and stores the hash index under `--texture-cache-dir`.
+
+Practical interpretation:
+
+- Use `--texture-cache-dir` by default for scene work. It preserves output size and avoids re-encoding duplicate textures across models and runs.
+- For `FoxScenePackager`, use the current default `webp-lossy` at quality `90` / method `0`. It is much smaller than PNG and close to fast-PNG encode time on the MBQF sample.
+- Add `--texture-format png --fast-png` only for compatibility iteration builds where larger GLBs are acceptable.
+- Keep `--no-model-textures` for geometry/placement debugging.
+- KTX2/Basis remains worth testing later for GPU-native texture delivery, but it needs an additional encoder/toolchain. WebP is the practical default with the current .NET pipeline.
 
 ## Important fixes already in this repo
 
@@ -51,6 +124,8 @@ These are already implemented in the current codebase and are easy to forget whe
   - `.htre` terrain is converted to generated mesh geometry,
   - terrain sidecar files are written beside the scene output.
 - scene composition now deduplicates imported GLB samplers, images, textures, and materials.
+- portable foxscene export now exists as an alternative to monolithic scene GLB composition.
+- LBA locator files with layout `3` are parsed as `translation + rotation + scale` records. Without this, `*_scl.lba` gimmick placements, such as cables in `afgh_148_130_asset`, are read with a 32-byte stride and every following instance is misplaced.
 
 ## How to read a scene quickly
 
@@ -122,23 +197,49 @@ Raw export stats from `afgh_stage.scene.compact.json`:
 - `nodeCount = 42322`
 - `fmdlCount = 1653`
 
-Full-scene composition currently still fails for `afgh_stage` because the final scene is too large and eventually trips `Stream was too long`.
+Portable foxscene package generated successfully:
+
+- `D:\BOTW\MGSV\EXPORTED\Assets\tpp\level\location\afgh\afgh_stage.foxscene.json`
+- `1297` independent GLBs under `afgh_stage.models`
+- model GLBs total `2,727,511,120` bytes
+- `4143` layers, `42322` nodes, `31472` placements, `0` package warnings
+- largest GLB: `afgh_buld003.glb`, `42,378,712` bytes
+
+Viewer validation:
+
+- `autoload=none` loads the full AFGH manifest and layer list without materializing 42k Three.js nodes.
+- `layers=afgh_147_130_asset` loaded `24` GLBs / `107` placements.
+- `layers=afgh_village_asset` loaded `185` GLBs / `2479` placements and reached `Ready`.
+
+Monolithic full-scene GLB composition still fails for `afgh_stage` because the final scene is too large and eventually trips `Stream was too long`.
 
 That means:
 
 - `Fox2SceneConverter` is working for this map
-- the memory ceiling is hit in final composition / write-out, not in FOX2 discovery
+- the memory ceiling is hit in monolithic composition / write-out, not in FOX2 discovery or foxscene packaging
 
 ## Layered export strategy for huge scenes
 
 For very large scenes, do **not** insist on a single monolithic GLB first.
 
+The preferred long-term artifact is now a `*.foxscene.json` package with independent GLBs. Layered merged GLBs are still useful for Blender inspection, but foxscene avoids duplicating all geometry into one final file and preserves scene/file/layer boundaries for other runtimes.
+
+Current foxscene limitation: it packages FMDL-backed model placements. TerrainBlock nodes and their metadata stay in the scene JSON, but generated `.htre` terrain geometry still needs a follow-up terrain-asset packager before the Web viewer can render terrain directly.
+
+The Web viewer should be used in incremental mode for maps at AFGH scale. Serve the repo and exported assets from a common HTTP root, pass `autoload=none` to inspect the manifest only, or pass `layers=<layer name>` to load one area at a time. The viewer intentionally builds Three.js node objects only for loaded layers.
+
 Instead:
 
 1. generate the full `.scene.compact.json`
-2. split it into smaller compact scenes by `files[*].path` prefix
-3. feed each smaller compact scene into `SceneGltfComposer`
-4. inspect the resulting multiple GLBs in Blender
+2. run `FoxScenePackager` to create the portable scene package
+3. inspect the package in `tools\FoxSceneViewer`
+4. only split into smaller compact scenes for Blender or when a target runtime cannot stream the full package
+
+For Blender-only inspection, the old layered GLB path is still:
+
+1. split the compact scene by `files[*].path` prefix
+2. feed each smaller compact scene into `SceneGltfComposer`
+3. inspect the resulting multiple GLBs in Blender
 
 This worked for `afgh_stage`.
 

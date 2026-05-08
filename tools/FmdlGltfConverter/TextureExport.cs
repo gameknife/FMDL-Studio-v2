@@ -1,7 +1,12 @@
 using System.IO.Compression;
+using System.Diagnostics;
+using System.Security.Cryptography;
+using System.Text;
 using Pfim;
 using SixLabors.ImageSharp;
+using SixLabors.ImageSharp.Formats;
 using SixLabors.ImageSharp.Formats.Png;
+using SixLabors.ImageSharp.Formats.Webp;
 using SixLabors.ImageSharp.PixelFormats;
 
 namespace FmdlGltfConverter;
@@ -12,13 +17,15 @@ internal sealed class TextureExportContext
     private readonly GltfBufferBuilder bufferBuilder;
     private readonly FoxTextureResolver textureResolver;
     private readonly Dictionary<string, int> textureIndicesBySourcePath = new(StringComparer.OrdinalIgnoreCase);
+    private readonly TextureProfileCsvWriter? profiler;
     private readonly int samplerIndex;
 
-    public TextureExportContext(GltfRoot gltf, GltfBufferBuilder bufferBuilder, string sourceModelPath)
+    public TextureExportContext(GltfRoot gltf, GltfBufferBuilder bufferBuilder, string sourceModelPath, TextureExportOptions options)
     {
         this.gltf = gltf;
         this.bufferBuilder = bufferBuilder;
-        textureResolver = new FoxTextureResolver(sourceModelPath);
+        profiler = options.Profiler;
+        textureResolver = new FoxTextureResolver(sourceModelPath, options);
 
         samplerIndex = gltf.Samplers.Count;
         gltf.Samplers.Add(new GltfSampler
@@ -32,25 +39,51 @@ internal sealed class TextureExportContext
 
     public int? AddTexture(string reference, FoxTextureUsage usage = FoxTextureUsage.Default)
     {
+        Stopwatch resolveStopwatch = Stopwatch.StartNew();
         TextureAsset? textureAsset = textureResolver.Resolve(reference, usage);
+        resolveStopwatch.Stop();
         if (textureAsset is null)
         {
+            profiler?.Write(new TextureProfileEvent
+            {
+                SourcePath = string.Empty,
+                Reference = reference,
+                Usage = usage,
+                Operation = "missing",
+                Extension = string.Empty,
+                ResolveMilliseconds = resolveStopwatch.ElapsedMilliseconds,
+                TotalMilliseconds = resolveStopwatch.ElapsedMilliseconds,
+            });
             return null;
         }
 
         string cacheKey = $"{textureAsset.SourcePath}|{usage}";
         if (textureIndicesBySourcePath.TryGetValue(cacheKey, out int existingTextureIndex))
         {
+            profiler?.Write(new TextureProfileEvent
+            {
+                SourcePath = textureAsset.SourcePath,
+                Reference = reference,
+                Usage = usage,
+                Operation = "gltf-reuse",
+                Extension = Path.GetExtension(textureAsset.SourcePath),
+                Format = textureAsset.Format.CacheKey,
+                EncodedBytes = textureAsset.EncodedBytes.Length,
+                ResolveMilliseconds = resolveStopwatch.ElapsedMilliseconds,
+                TotalMilliseconds = resolveStopwatch.ElapsedMilliseconds,
+            });
             return existingTextureIndex;
         }
 
         int bufferViewIndex = gltf.BufferViews.Count;
-        int byteOffset = bufferBuilder.AddBytes(textureAsset.PngBytes);
+        Stopwatch embedStopwatch = Stopwatch.StartNew();
+        int byteOffset = bufferBuilder.AddBytes(textureAsset.EncodedBytes);
+        embedStopwatch.Stop();
         gltf.BufferViews.Add(new GltfBufferView
         {
             Buffer = 0,
             ByteOffset = byteOffset,
-            ByteLength = textureAsset.PngBytes.Length,
+            ByteLength = textureAsset.EncodedBytes.Length,
         });
 
         int imageIndex = gltf.Images.Count;
@@ -58,19 +91,60 @@ internal sealed class TextureExportContext
         {
             Name = Path.GetFileNameWithoutExtension(textureAsset.SourcePath),
             BufferView = bufferViewIndex,
-            MimeType = "image/png",
+            MimeType = textureAsset.MimeType,
         });
 
         int textureIndex = gltf.Textures.Count;
-        gltf.Textures.Add(new GltfTexture
+        GltfTexture texture = new()
         {
             Name = Path.GetFileNameWithoutExtension(textureAsset.SourcePath),
             Sampler = samplerIndex,
-            Source = imageIndex,
-        });
+        };
+        if (textureAsset.Format.RequiresWebpExtension)
+        {
+            EnsureRequiredExtension("EXT_texture_webp");
+            texture.Extensions = new Dictionary<string, object?>
+            {
+                ["EXT_texture_webp"] = new GltfTextureSourceExtension { Source = imageIndex },
+            };
+        }
+        else
+        {
+            texture.Source = imageIndex;
+        }
+
+        gltf.Textures.Add(texture);
 
         textureIndicesBySourcePath.Add(cacheKey, textureIndex);
+        profiler?.Write(new TextureProfileEvent
+        {
+            SourcePath = textureAsset.SourcePath,
+            Reference = reference,
+            Usage = usage,
+            Operation = "gltf-embed",
+            Extension = Path.GetExtension(textureAsset.SourcePath),
+            Format = textureAsset.Format.CacheKey,
+            EncodedBytes = textureAsset.EncodedBytes.Length,
+            ResolveMilliseconds = resolveStopwatch.ElapsedMilliseconds,
+            EmbedMilliseconds = embedStopwatch.ElapsedMilliseconds,
+            TotalMilliseconds = resolveStopwatch.ElapsedMilliseconds + embedStopwatch.ElapsedMilliseconds,
+        });
         return textureIndex;
+    }
+
+    private void EnsureRequiredExtension(string extensionName)
+    {
+        gltf.ExtensionsUsed ??= [];
+        if (!gltf.ExtensionsUsed.Contains(extensionName, StringComparer.Ordinal))
+        {
+            gltf.ExtensionsUsed.Add(extensionName);
+        }
+
+        gltf.ExtensionsRequired ??= [];
+        if (!gltf.ExtensionsRequired.Contains(extensionName, StringComparer.Ordinal))
+        {
+            gltf.ExtensionsRequired.Add(extensionName);
+        }
     }
 }
 
@@ -82,10 +156,12 @@ internal sealed class FoxTextureResolver
 
     private readonly string modelDirectory;
     private readonly string? assetsRoot;
+    private readonly TextureExportOptions options;
     private readonly Dictionary<string, TextureAsset?> cache = new(StringComparer.OrdinalIgnoreCase);
 
-    public FoxTextureResolver(string sourceModelPath)
+    public FoxTextureResolver(string sourceModelPath, TextureExportOptions options)
     {
+        this.options = options;
         modelDirectory = Path.GetDirectoryName(sourceModelPath) ?? Directory.GetCurrentDirectory();
         assetsRoot = FindAssetsRoot(sourceModelPath);
     }
@@ -107,19 +183,154 @@ internal sealed class FoxTextureResolver
 
     private TextureAsset? LoadTexture(string texturePath, FoxTextureUsage usage)
     {
-        string extension = Path.GetExtension(texturePath);
-        byte[] pngBytes = extension.ToLowerInvariant() switch
+        Stopwatch totalStopwatch = Stopwatch.StartNew();
+        string? cachePath = TryBuildCachePath(texturePath, usage);
+        if (cachePath is not null && File.Exists(cachePath))
         {
-            ".ftex" => TextureTranscoder.ConvertFtexToPng(texturePath, usage),
-            ".dds" => TextureTranscoder.ConvertDdsToPng(File.ReadAllBytes(texturePath), usage),
-            _ => TextureTranscoder.ConvertImageFileToPng(texturePath, usage),
+            try
+            {
+                Stopwatch cacheReadStopwatch = Stopwatch.StartNew();
+                byte[] cachedTextureBytes = File.ReadAllBytes(cachePath);
+                cacheReadStopwatch.Stop();
+                totalStopwatch.Stop();
+                options.Profiler?.Write(new TextureProfileEvent
+                {
+                    SourcePath = texturePath,
+                    Usage = usage,
+                    Operation = "cache-read",
+                    Extension = Path.GetExtension(texturePath),
+                    Format = options.Format.CacheKey,
+                    SourceBytes = GetFileLength(texturePath),
+                    EncodedBytes = cachedTextureBytes.Length,
+                    CacheReadMilliseconds = cacheReadStopwatch.ElapsedMilliseconds,
+                    TotalMilliseconds = totalStopwatch.ElapsedMilliseconds,
+                });
+                return new TextureAsset(texturePath, cachedTextureBytes, options.Format.MimeType, options.Format);
+            }
+            catch (IOException)
+            {
+                // Another converter may be replacing a stale cache file. Fall back
+                // to conversion and rewrite below.
+            }
+        }
+
+        string extension = Path.GetExtension(texturePath);
+        TextureTranscodeResult transcodeResult = extension.ToLowerInvariant() switch
+        {
+            ".ftex" => TextureTranscoder.ConvertFtexToPng(texturePath, usage, options),
+            ".dds" => TextureTranscoder.ConvertDdsFileToPng(texturePath, usage, options),
+            _ => TextureTranscoder.ConvertImageFileToPng(texturePath, usage, options),
         };
 
-        return new TextureAsset(texturePath, pngBytes);
+        long cacheWriteMilliseconds = 0;
+        if (cachePath is not null)
+        {
+            Stopwatch cacheWriteStopwatch = Stopwatch.StartNew();
+            TryWriteCache(cachePath, transcodeResult.EncodedBytes);
+            cacheWriteStopwatch.Stop();
+            cacheWriteMilliseconds = cacheWriteStopwatch.ElapsedMilliseconds;
+        }
+
+        totalStopwatch.Stop();
+        options.Profiler?.Write(new TextureProfileEvent
+        {
+            SourcePath = texturePath,
+            Usage = usage,
+            Operation = "transcode",
+            Extension = extension,
+            Format = options.Format.CacheKey,
+            SourceBytes = GetFileLength(texturePath),
+            EncodedBytes = transcodeResult.EncodedBytes.Length,
+            Width = transcodeResult.Width,
+            Height = transcodeResult.Height,
+            CacheWriteMilliseconds = cacheWriteMilliseconds,
+            SourceReadMilliseconds = transcodeResult.SourceReadMilliseconds,
+            FtexReadMilliseconds = transcodeResult.FtexReadMilliseconds,
+            DdsLoadMilliseconds = transcodeResult.DdsLoadMilliseconds,
+            DdsDecompressMilliseconds = transcodeResult.DdsDecompressMilliseconds,
+            RgbaConvertMilliseconds = transcodeResult.RgbaConvertMilliseconds,
+            ImageLoadMilliseconds = transcodeResult.ImageLoadMilliseconds,
+            UsageTransformMilliseconds = transcodeResult.UsageTransformMilliseconds,
+            TextureEncodeMilliseconds = transcodeResult.TextureEncodeMilliseconds,
+            TotalMilliseconds = totalStopwatch.ElapsedMilliseconds,
+        });
+
+        return new TextureAsset(texturePath, transcodeResult.EncodedBytes, options.Format.MimeType, options.Format);
+    }
+
+    private static long GetFileLength(string path)
+    {
+        try
+        {
+            return new FileInfo(path).Length;
+        }
+        catch (IOException)
+        {
+            return 0;
+        }
+    }
+
+    private string? TryBuildCachePath(string texturePath, FoxTextureUsage usage)
+    {
+        if (string.IsNullOrWhiteSpace(options.CacheDirectoryPath))
+        {
+            return null;
+        }
+
+        FileInfo fileInfo = new(texturePath);
+        if (!fileInfo.Exists)
+        {
+            return null;
+        }
+
+        string signature = string.Join(
+            "|",
+            Path.GetFullPath(texturePath).ToLowerInvariant(),
+            fileInfo.Length.ToString(System.Globalization.CultureInfo.InvariantCulture),
+            fileInfo.LastWriteTimeUtc.Ticks.ToString(System.Globalization.CultureInfo.InvariantCulture),
+            usage.ToString(),
+            options.EncoderCacheKey);
+        string hash = Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(signature))).ToLowerInvariant();
+        return Path.Combine(options.CacheDirectoryPath, hash[..2], hash + options.Format.FileExtension);
+    }
+
+    private static void TryWriteCache(string cachePath, byte[] textureBytes)
+    {
+        string directory = Path.GetDirectoryName(cachePath) ?? Directory.GetCurrentDirectory();
+        Directory.CreateDirectory(directory);
+        string tempPath = Path.Combine(directory, Path.GetFileName(cachePath) + "." + Guid.NewGuid().ToString("N") + ".tmp");
+
+        try
+        {
+            File.WriteAllBytes(tempPath, textureBytes);
+            File.Move(tempPath, cachePath, overwrite: false);
+        }
+        catch (IOException)
+        {
+            // A parallel converter may have won the race. The cache is only an
+            // acceleration path, so keep the current conversion result.
+        }
+        finally
+        {
+            if (File.Exists(tempPath))
+            {
+                File.Delete(tempPath);
+            }
+        }
     }
 
     private string? FindTexturePath(string reference)
     {
+        bool hashReference = TryParseHashReference(reference, out _, out _);
+        if (hashReference)
+        {
+            string? hashedMatch = FindHashedTexturePath(reference);
+            if (hashedMatch is not null)
+            {
+                return hashedMatch;
+            }
+        }
+
         foreach (string candidate in ExpandCandidates(reference))
         {
             if (File.Exists(candidate))
@@ -128,10 +339,13 @@ internal sealed class FoxTextureResolver
             }
         }
 
-        string? hashedMatch = FindHashedTexturePath(reference);
-        if (hashedMatch is not null)
+        if (!hashReference)
         {
-            return hashedMatch;
+            string? hashedMatch = FindHashedTexturePath(reference);
+            if (hashedMatch is not null)
+            {
+                return hashedMatch;
+            }
         }
 
         return null;
@@ -234,7 +448,7 @@ internal sealed class FoxTextureResolver
             return null;
         }
 
-        IReadOnlyDictionary<ulong, string> hashedTextureIndex = GetHashedTextureIndex(assetsRoot);
+        IReadOnlyDictionary<ulong, string> hashedTextureIndex = GetHashedTextureIndex(assetsRoot, options.CacheDirectoryPath);
         if (hashedTextureIndex.TryGetValue(rawHash, out string? texturePath))
         {
             return texturePath;
@@ -261,17 +475,112 @@ internal sealed class FoxTextureResolver
         return true;
     }
 
-    private static IReadOnlyDictionary<ulong, string> GetHashedTextureIndex(string assetsRoot)
+    private static IReadOnlyDictionary<ulong, string> GetHashedTextureIndex(string assetsRoot, string? cacheDirectoryPath)
     {
         lock (HashedTextureIndexLock)
         {
             if (!HashedTextureIndicesByAssetsRoot.TryGetValue(assetsRoot, out IReadOnlyDictionary<ulong, string>? index))
             {
-                index = BuildHashedTextureIndex(assetsRoot);
+                string? cachePath = TryBuildHashedTextureIndexCachePath(assetsRoot, cacheDirectoryPath);
+                index = cachePath is not null ? TryReadHashedTextureIndexCache(assetsRoot, cachePath) : null;
+                if (index is null)
+                {
+                    index = BuildHashedTextureIndex(assetsRoot);
+                    if (cachePath is not null)
+                    {
+                        TryWriteHashedTextureIndexCache(assetsRoot, cachePath, index);
+                    }
+                }
+
                 HashedTextureIndicesByAssetsRoot.Add(assetsRoot, index);
             }
 
             return index;
+        }
+    }
+
+    private static string? TryBuildHashedTextureIndexCachePath(string assetsRoot, string? cacheDirectoryPath)
+    {
+        if (string.IsNullOrWhiteSpace(cacheDirectoryPath))
+        {
+            return null;
+        }
+
+        string signature = Path.GetFullPath(assetsRoot).ToLowerInvariant();
+        string hash = Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(signature))).ToLowerInvariant();
+        return Path.Combine(cacheDirectoryPath, "_texture-index", hash + ".tsv");
+    }
+
+    private static IReadOnlyDictionary<ulong, string>? TryReadHashedTextureIndexCache(string assetsRoot, string cachePath)
+    {
+        if (!File.Exists(cachePath))
+        {
+            return null;
+        }
+
+        try
+        {
+            Dictionary<ulong, string> index = new();
+            foreach (string line in File.ReadLines(cachePath))
+            {
+                string[] parts = line.Split('\t', 2);
+                if (parts.Length != 2 ||
+                    !ulong.TryParse(parts[0], System.Globalization.NumberStyles.HexNumber, null, out ulong hash))
+                {
+                    return null;
+                }
+
+                string filePath = Path.GetFullPath(Path.Combine(assetsRoot, parts[1]));
+                index.TryAdd(hash, filePath);
+            }
+
+            return index;
+        }
+        catch (IOException)
+        {
+            return null;
+        }
+        catch (UnauthorizedAccessException)
+        {
+            return null;
+        }
+    }
+
+    private static void TryWriteHashedTextureIndexCache(string assetsRoot, string cachePath, IReadOnlyDictionary<ulong, string> index)
+    {
+        string directory = Path.GetDirectoryName(cachePath) ?? Directory.GetCurrentDirectory();
+        Directory.CreateDirectory(directory);
+        string tempPath = Path.Combine(directory, Path.GetFileName(cachePath) + "." + Guid.NewGuid().ToString("N") + ".tmp");
+
+        try
+        {
+            using (StreamWriter writer = new(tempPath, append: false, Encoding.UTF8))
+            {
+                foreach ((ulong hash, string filePath) in index.OrderBy(item => item.Key))
+                {
+                    string relativePath = Path.GetRelativePath(assetsRoot, filePath);
+                    writer.Write(hash.ToString("x16", System.Globalization.CultureInfo.InvariantCulture));
+                    writer.Write('\t');
+                    writer.WriteLine(relativePath);
+                }
+            }
+
+            File.Move(tempPath, cachePath, overwrite: false);
+        }
+        catch (IOException)
+        {
+            // Another converter may have written the same index first.
+        }
+        catch (UnauthorizedAccessException)
+        {
+            // Cache persistence is optional.
+        }
+        finally
+        {
+            if (File.Exists(tempPath))
+            {
+                File.Delete(tempPath);
+            }
         }
     }
 
@@ -320,7 +629,80 @@ internal sealed class FoxTextureResolver
     }
 }
 
-internal sealed record TextureAsset(string SourcePath, byte[] PngBytes);
+internal sealed record TextureAsset(string SourcePath, byte[] EncodedBytes, string MimeType, TextureContainerFormat Format);
+
+internal sealed class TextureExportOptions
+{
+    public static TextureExportOptions Default { get; } = new();
+
+    public string? CacheDirectoryPath { get; init; }
+    public TextureContainerFormat Format { get; init; } = TextureContainerFormat.Png;
+    public bool FastPng { get; init; }
+    public int WebpQuality { get; init; } = 90;
+    public int WebpMethod { get; init; } = 4;
+    public TextureProfileCsvWriter? Profiler { get; init; }
+    public string EncoderCacheKey => Format.Name switch
+    {
+        "png" => FastPng ? "png-best-speed-none-v1" : "png-default-v1",
+        "webp-lossless" => FormattableString.Invariant($"webp-lossless-q{WebpQuality}-m{WebpMethod}-v1"),
+        "webp-lossy" => FormattableString.Invariant($"webp-lossy-q{WebpQuality}-m{WebpMethod}-v1"),
+        _ => Format.Name,
+    };
+
+    public IImageEncoder CreateTextureEncoder()
+    {
+        if (Format.Name == "png")
+        {
+            return FastPng
+                ? new PngEncoder
+                {
+                    CompressionLevel = PngCompressionLevel.BestSpeed,
+                    FilterMethod = PngFilterMethod.None,
+                }
+                : new PngEncoder();
+        }
+
+        return new WebpEncoder
+        {
+            FileFormat = Format.Name == "webp-lossless" ? WebpFileFormatType.Lossless : WebpFileFormatType.Lossy,
+            Quality = Math.Clamp(WebpQuality, 0, 100),
+            Method = (WebpEncodingMethod)Math.Clamp(WebpMethod, 0, 6),
+        };
+    }
+}
+
+internal sealed record TextureContainerFormat(
+    string Name,
+    string MimeType,
+    string FileExtension,
+    bool RequiresWebpExtension)
+{
+    public static TextureContainerFormat Png { get; } = new("png", "image/png", ".png", RequiresWebpExtension: false);
+    public static TextureContainerFormat WebpLossless { get; } = new("webp-lossless", "image/webp", ".webp", RequiresWebpExtension: true);
+    public static TextureContainerFormat WebpLossy { get; } = new("webp-lossy", "image/webp", ".webp", RequiresWebpExtension: true);
+
+    public string CacheKey => Name;
+
+    public static bool TryParse(string value, out TextureContainerFormat format)
+    {
+        switch (value.ToLowerInvariant())
+        {
+            case "png":
+                format = Png;
+                return true;
+            case "webp":
+            case "webp-lossy":
+                format = WebpLossy;
+                return true;
+            case "webp-lossless":
+                format = WebpLossless;
+                return true;
+            default:
+                format = Png;
+                return false;
+        }
+    }
+}
 
 internal enum FoxTextureUsage
 {
@@ -333,38 +715,111 @@ internal static class TextureTranscoder
 {
     private static readonly byte[] FtexMagic = [0x46, 0x54, 0x45, 0x58, 0x85, 0xEB, 0x01, 0x40];
 
-    public static byte[] ConvertFtexToPng(string ftexPath, FoxTextureUsage usage = FoxTextureUsage.Default)
+    public static TextureTranscodeResult ConvertFtexToPng(string ftexPath, FoxTextureUsage usage, TextureExportOptions options)
     {
+        Stopwatch totalStopwatch = Stopwatch.StartNew();
+        Stopwatch ftexStopwatch = Stopwatch.StartNew();
         byte[] ddsBytes = ConvertFtexToDds(ftexPath);
-        return ConvertDdsToPng(ddsBytes, usage);
+        ftexStopwatch.Stop();
+        TextureTranscodeResult ddsResult = ConvertDdsBytesToPng(ddsBytes, usage, options);
+        totalStopwatch.Stop();
+
+        return ddsResult with
+        {
+            FtexReadMilliseconds = ftexStopwatch.ElapsedMilliseconds,
+            TotalMilliseconds = totalStopwatch.ElapsedMilliseconds,
+        };
     }
 
-    public static byte[] ConvertImageFileToPng(string imagePath, FoxTextureUsage usage = FoxTextureUsage.Default)
+    public static TextureTranscodeResult ConvertImageFileToPng(string imagePath, FoxTextureUsage usage, TextureExportOptions options)
     {
+        Stopwatch totalStopwatch = Stopwatch.StartNew();
+        Stopwatch imageLoadStopwatch = Stopwatch.StartNew();
         using Image<Rgba32> image = SixLabors.ImageSharp.Image.Load<Rgba32>(imagePath);
+        imageLoadStopwatch.Stop();
+
+        Stopwatch usageTransformStopwatch = Stopwatch.StartNew();
         ApplyUsageTransform(image, usage);
-        using MemoryStream pngStream = new();
-        image.SaveAsPng(pngStream, new PngEncoder());
-        return pngStream.ToArray();
+        usageTransformStopwatch.Stop();
+
+        using MemoryStream textureStream = new();
+        Stopwatch textureEncodeStopwatch = Stopwatch.StartNew();
+        image.Save(textureStream, options.CreateTextureEncoder());
+        textureEncodeStopwatch.Stop();
+        totalStopwatch.Stop();
+
+        return new TextureTranscodeResult
+        {
+            EncodedBytes = textureStream.ToArray(),
+            Width = image.Width,
+            Height = image.Height,
+            ImageLoadMilliseconds = imageLoadStopwatch.ElapsedMilliseconds,
+            UsageTransformMilliseconds = usageTransformStopwatch.ElapsedMilliseconds,
+            TextureEncodeMilliseconds = textureEncodeStopwatch.ElapsedMilliseconds,
+            TotalMilliseconds = totalStopwatch.ElapsedMilliseconds,
+        };
     }
 
-    public static byte[] ConvertDdsToPng(byte[] ddsBytes, FoxTextureUsage usage = FoxTextureUsage.Default)
+    public static TextureTranscodeResult ConvertDdsFileToPng(string ddsPath, FoxTextureUsage usage, TextureExportOptions options)
     {
-        using MemoryStream ddsStream = new(ddsBytes, writable: false);
-        using IImage image = Pfimage.FromStream(ddsStream);
+        Stopwatch totalStopwatch = Stopwatch.StartNew();
+        Stopwatch sourceReadStopwatch = Stopwatch.StartNew();
+        byte[] ddsBytes = File.ReadAllBytes(ddsPath);
+        sourceReadStopwatch.Stop();
+        TextureTranscodeResult result = ConvertDdsBytesToPng(ddsBytes, usage, options);
+        totalStopwatch.Stop();
 
+        return result with
+        {
+            SourceReadMilliseconds = sourceReadStopwatch.ElapsedMilliseconds,
+            TotalMilliseconds = totalStopwatch.ElapsedMilliseconds,
+        };
+    }
+
+    private static TextureTranscodeResult ConvertDdsBytesToPng(byte[] ddsBytes, FoxTextureUsage usage, TextureExportOptions options)
+    {
+        Stopwatch totalStopwatch = Stopwatch.StartNew();
+        using MemoryStream ddsStream = new(ddsBytes, writable: false);
+        Stopwatch ddsLoadStopwatch = Stopwatch.StartNew();
+        using IImage image = Pfimage.FromStream(ddsStream);
+        ddsLoadStopwatch.Stop();
+
+        long ddsDecompressMilliseconds = 0;
         if (image.Compressed)
         {
+            Stopwatch ddsDecompressStopwatch = Stopwatch.StartNew();
             image.Decompress();
+            ddsDecompressStopwatch.Stop();
+            ddsDecompressMilliseconds = ddsDecompressStopwatch.ElapsedMilliseconds;
         }
 
+        Stopwatch rgbaConvertStopwatch = Stopwatch.StartNew();
         byte[] rgbaBytes = ConvertToRgba32(image);
-
         using Image<Rgba32> rgbaImage = Image.LoadPixelData<Rgba32>(rgbaBytes, image.Width, image.Height);
+        rgbaConvertStopwatch.Stop();
+
+        Stopwatch usageTransformStopwatch = Stopwatch.StartNew();
         ApplyUsageTransform(rgbaImage, usage);
-        using MemoryStream pngStream = new();
-        rgbaImage.SaveAsPng(pngStream, new PngEncoder());
-        return pngStream.ToArray();
+        usageTransformStopwatch.Stop();
+
+        using MemoryStream textureStream = new();
+        Stopwatch textureEncodeStopwatch = Stopwatch.StartNew();
+        rgbaImage.Save(textureStream, options.CreateTextureEncoder());
+        textureEncodeStopwatch.Stop();
+        totalStopwatch.Stop();
+
+        return new TextureTranscodeResult
+        {
+            EncodedBytes = textureStream.ToArray(),
+            Width = image.Width,
+            Height = image.Height,
+            DdsLoadMilliseconds = ddsLoadStopwatch.ElapsedMilliseconds,
+            DdsDecompressMilliseconds = ddsDecompressMilliseconds,
+            RgbaConvertMilliseconds = rgbaConvertStopwatch.ElapsedMilliseconds,
+            UsageTransformMilliseconds = usageTransformStopwatch.ElapsedMilliseconds,
+            TextureEncodeMilliseconds = textureEncodeStopwatch.ElapsedMilliseconds,
+            TotalMilliseconds = totalStopwatch.ElapsedMilliseconds,
+        };
     }
 
     private static void ApplyUsageTransform(Image<Rgba32> image, FoxTextureUsage usage)

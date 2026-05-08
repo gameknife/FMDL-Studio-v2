@@ -6,6 +6,14 @@ internal sealed class CliOptions
     public string? StringDictionaryPath { get; init; }
     public string? PathDictionaryPath { get; init; }
     public bool UseDictionaries { get; init; } = true;
+    public bool NoTextures { get; init; }
+    public string? ProfilePath { get; init; }
+    public string? TextureProfilePath { get; init; }
+    public string? TextureCacheDirectoryPath { get; init; }
+    public TextureContainerFormat TextureFormat { get; init; } = TextureContainerFormat.Png;
+    public bool FastPng { get; init; }
+    public int WebpQuality { get; init; } = 90;
+    public int WebpMethod { get; init; } = 4;
 
     public string InputPath => Jobs[0].InputPath;
 
@@ -19,7 +27,15 @@ internal sealed class CliOptions
         List<string> positional = new();
         string? stringDictionaryPath = null;
         string? pathDictionaryPath = null;
+        string? profilePath = null;
+        string? textureProfilePath = null;
+        string? textureCacheDirectoryPath = null;
+        TextureContainerFormat textureFormat = TextureContainerFormat.Png;
         bool useDictionaries = true;
+        bool noTextures = false;
+        bool fastPng = false;
+        int webpQuality = 90;
+        int webpMethod = 4;
 
         for (int index = 0; index < args.Length; index++)
         {
@@ -35,6 +51,42 @@ internal sealed class CliOptions
                     break;
                 case "--no-dictionaries":
                     useDictionaries = false;
+                    break;
+                case "--no-textures":
+                    noTextures = true;
+                    break;
+                case "--profile":
+                    profilePath = ReadValue(args, ref index, argument);
+                    break;
+                case "--texture-profile":
+                    textureProfilePath = ReadValue(args, ref index, argument);
+                    break;
+                case "--texture-cache-dir":
+                    textureCacheDirectoryPath = ReadValue(args, ref index, argument);
+                    break;
+                case "--texture-format":
+                    string textureFormatText = ReadValue(args, ref index, argument);
+                    if (!TextureContainerFormat.TryParse(textureFormatText, out textureFormat))
+                    {
+                        throw new CommandLineException(FormattableString.Invariant($"Option '{argument}' must be one of: png, webp-lossless, webp-lossy."));
+                    }
+                    break;
+                case "--fast-png":
+                    fastPng = true;
+                    break;
+                case "--webp-quality":
+                    string qualityText = ReadValue(args, ref index, argument);
+                    if (!int.TryParse(qualityText, out webpQuality) || webpQuality is < 0 or > 100)
+                    {
+                        throw new CommandLineException(FormattableString.Invariant($"Option '{argument}' requires an integer from 0 to 100."));
+                    }
+                    break;
+                case "--webp-method":
+                    string methodText = ReadValue(args, ref index, argument);
+                    if (!int.TryParse(methodText, out webpMethod) || webpMethod is < 0 or > 6)
+                    {
+                        throw new CommandLineException(FormattableString.Invariant($"Option '{argument}' requires an integer from 0 to 6."));
+                    }
                     break;
                 default:
                     if (argument.StartsWith("--", StringComparison.Ordinal))
@@ -63,14 +115,22 @@ internal sealed class CliOptions
             StringDictionaryPath = stringDictionaryPath is null ? null : Path.GetFullPath(stringDictionaryPath),
             PathDictionaryPath = pathDictionaryPath is null ? null : Path.GetFullPath(pathDictionaryPath),
             UseDictionaries = useDictionaries,
+            NoTextures = noTextures,
+            ProfilePath = profilePath is null ? null : Path.GetFullPath(profilePath),
+            TextureProfilePath = textureProfilePath is null ? null : Path.GetFullPath(textureProfilePath),
+            TextureCacheDirectoryPath = textureCacheDirectoryPath is null ? null : Path.GetFullPath(textureCacheDirectoryPath),
+            TextureFormat = textureFormat,
+            FastPng = fastPng,
+            WebpQuality = webpQuality,
+            WebpMethod = webpMethod,
         };
     }
 
     public static void PrintUsage(TextWriter writer)
     {
         writer.WriteLine("Usage:");
-        writer.WriteLine("  FmdlGltfConverter <input.fmdl> [output.gltf|output.glb] [--string-dict <path>] [--path-dict <path>] [--no-dictionaries]");
-        writer.WriteLine("  FmdlGltfConverter <input1.fmdl> <input2.fmdl> [input3.fmdl ...] [--string-dict <path>] [--path-dict <path>] [--no-dictionaries]");
+        writer.WriteLine("  FmdlGltfConverter <input.fmdl> [output.gltf|output.glb] [--string-dict <path>] [--path-dict <path>] [--no-dictionaries] [--no-textures] [--profile <csv>] [--texture-profile <csv>] [--texture-cache-dir <path>] [--texture-format <png|webp-lossless|webp-lossy>] [--fast-png] [--webp-quality <0-100>] [--webp-method <0-6>]");
+        writer.WriteLine("  FmdlGltfConverter <input1.fmdl> <input2.fmdl> [input3.fmdl ...] [--string-dict <path>] [--path-dict <path>] [--no-dictionaries] [--no-textures] [--profile <csv>] [--texture-profile <csv>] [--texture-cache-dir <path>] [--texture-format <png|webp-lossless|webp-lossy>] [--fast-png] [--webp-quality <0-100>] [--webp-method <0-6>]");
         writer.WriteLine();
         writer.WriteLine("If only input .fmdl paths are provided, the converter writes same-name .glb files beside each input file.");
         writer.WriteLine();

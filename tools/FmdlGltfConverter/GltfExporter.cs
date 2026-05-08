@@ -14,7 +14,13 @@ internal sealed class GltfExporter
         WriteIndented = true,
     };
 
-    public void Export(FmdlFile fmdl, string sourceModelPath, string outputPath, FoxHashLookup hashLookup)
+    public void Export(
+        FmdlFile fmdl,
+        string sourceModelPath,
+        string outputPath,
+        FoxHashLookup hashLookup,
+        bool includeTextures = true,
+        TextureExportOptions? textureOptions = null)
     {
         Directory.CreateDirectory(Path.GetDirectoryName(outputPath) ?? Directory.GetCurrentDirectory());
 
@@ -40,7 +46,7 @@ internal sealed class GltfExporter
         };
 
         GltfBufferBuilder bufferBuilder = new();
-        TextureExportContext textureContext = new(gltf, bufferBuilder, sourceModelPath);
+        TextureExportContext textureContext = new(gltf, bufferBuilder, sourceModelPath, textureOptions ?? TextureExportOptions.Default);
         Dictionary<int, int> materialIndices = new();
 
         int rootNodeIndex = AddNode(gltf.Nodes, new GltfNode { Name = fmdl.Name });
@@ -139,7 +145,7 @@ internal sealed class GltfExporter
                 (joints, weights, usedBones) = BuildSkinningData(meshData.BoneWeights, meshData.BoneIndices, fmdl.BoneGroups[meshInfo.BoneGroupIndex], jointRemap);
             }
 
-            int? materialIndex = BuildMaterial(gltf, fmdl, meshInfo, hashLookup, textureContext, materialIndices);
+            int? materialIndex = BuildMaterial(gltf, fmdl, meshInfo, hashLookup, textureContext, materialIndices, includeTextures);
             int gltfMeshIndex = BuildMesh(gltf, bufferBuilder, meshIndex, positions, normals, tangents, uv0, uv1, uv2, uv3, joints, weights, indices, materialIndex);
             int? skinIndex = BuildSkin(gltf, bufferBuilder, meshIndex, usedBones, fmdl.Bones, boneNodeIndices, boneWorldPositions);
 
@@ -318,7 +324,8 @@ internal sealed class GltfExporter
         FmdlMeshInfo meshInfo,
         FoxHashLookup hashLookup,
         TextureExportContext textureContext,
-        Dictionary<int, int> materialIndices)
+        Dictionary<int, int> materialIndices,
+        bool includeTextures)
     {
         if (meshInfo.MaterialInstanceIndex >= fmdl.MaterialInstances.Length)
         {
@@ -409,7 +416,10 @@ internal sealed class GltfExporter
             },
         };
 
-        ApplyTextureAssignments(material, pbrMetallicRoughness, textureReferences, textureContext);
+        if (includeTextures)
+        {
+            ApplyTextureAssignments(material, pbrMetallicRoughness, textureReferences, textureContext);
+        }
 
         int materialIndex = gltf.Materials.Count;
         gltf.Materials.Add(material);
@@ -969,9 +979,16 @@ internal sealed class GltfBufferBuilder
         Align(4);
         int offset = (int)stream.Position;
 
-        foreach (byte value in values)
+        if (values is byte[] bytes)
         {
-            writer.Write(value);
+            writer.Write(bytes);
+        }
+        else
+        {
+            foreach (byte value in values)
+            {
+                writer.Write(value);
+            }
         }
 
         Align(4);
@@ -1007,6 +1024,8 @@ internal sealed class GltfRoot
     public required List<GltfTexture> Textures { get; init; }
     public required List<GltfSampler> Samplers { get; init; }
     public required List<GltfSkin> Skins { get; init; }
+    public List<string>? ExtensionsUsed { get; set; }
+    public List<string>? ExtensionsRequired { get; set; }
 }
 
 internal sealed class GltfAsset
@@ -1111,6 +1130,12 @@ internal sealed class GltfTexture
 {
     public string? Name { get; init; }
     public int? Sampler { get; init; }
+    public int? Source { get; set; }
+    public Dictionary<string, object?>? Extensions { get; set; }
+}
+
+internal sealed class GltfTextureSourceExtension
+{
     public required int Source { get; init; }
 }
 

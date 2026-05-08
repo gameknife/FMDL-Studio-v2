@@ -1,0 +1,78 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Fox Scene Viewer</title>
+    <link rel="stylesheet" href="./src/styles.css">
+  </head>
+  <body>
+    <main class="app">
+      <aside class="sidebar">
+        <header class="brand">
+          <h1>Fox Scene Viewer</h1>
+          <span id="statusText">Idle</span>
+        </header>
+
+        <section class="control-section">
+          <label class="field">
+            <span>Scene URL</span>
+            <input id="sceneUrl" type="url" spellcheck="false">
+          </label>
+          <div class="button-row">
+            <button id="loadUrlButton" type="button">Load</button>
+            <label class="file-button">
+              Open JSON
+              <input id="fileInput" type="file" accept=".json,.foxscene.json,application/json">
+            </label>
+          </div>
+          <div class="progress-track" aria-hidden="true">
+            <div id="progressBar"></div>
+          </div>
+        </section>
+
+        <section class="stats-grid" id="statsGrid">
+          <div><span>Layers</span><strong>0</strong></div>
+          <div><span>Nodes</span><strong>0</strong></div>
+          <div><span>Assets</span><strong>0</strong></div>
+          <div><span>Placed</span><strong>0</strong></div>
+        </section>
+
+        <section class="control-section layers-section">
+          <div class="section-title">Layers</div>
+          <div class="layer-tools">
+            <input id="layerFilter" type="search" placeholder="Filter layers" spellcheck="false">
+            <button id="loadVisibleLayersButton" type="button">Load</button>
+            <button id="unloadAllLayersButton" type="button">Unload</button>
+          </div>
+          <div id="layersList" class="layers-list"></div>
+        </section>
+
+        <section class="control-section log-section">
+          <div class="section-title">Log</div>
+          <div id="logList" class="log-list"></div>
+        </section>
+      </aside>
+
+      <section class="viewport" id="dropZone">
+        <canvas id="sceneCanvas"></canvas>
+        <div class="viewport-toolbar">
+          <span id="renderProbe">Render 0/0</span>
+          <button id="frameButton" type="button">Frame</button>
+          <button id="resetButton" type="button">Reset</button>
+        </div>
+        <div id="dropOverlay" class="drop-overlay">Drop foxscene JSON</div>
+      </section>
+    </main>
+
+    <script type="importmap">
+      {
+        "imports": {
+          "three": "https://cdn.jsdelivr.net/npm/three@0.164.1/build/three.module.js",
+          "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.164.1/examples/jsm/"
+        }
+      }
+    </script>
+    <script type="module" src="./src/main.js"></script>
+  </body>
+</html>

@@ -864,7 +864,10 @@ internal sealed class SceneDiscoveryService
         }
 
         uint count = BinaryPrimitives.ReadUInt32LittleEndian(data.AsSpan(0, 4));
-        int requiredLength = checked(16 + (int)count * 32);
+        uint layout = BinaryPrimitives.ReadUInt32LittleEndian(data.AsSpan(4, 4));
+        // Layout 3 appends a scale vec4 after the translation vec4 and rotation quaternion.
+        int recordSize = layout == 3 ? 48 : 32;
+        int requiredLength = checked(16 + (int)count * recordSize);
         if (count == 0 || data.Length < requiredLength)
         {
             return [];
@@ -873,7 +876,7 @@ internal sealed class SceneDiscoveryService
         List<LbaPlacement> placements = new((int)count);
         for (int index = 0; index < count; index++)
         {
-            int offset = 16 + index * 32;
+            int offset = 16 + index * recordSize;
             SceneNodeTransformDescription transform = new()
             {
                 Translation = new Dictionary<string, float>
@@ -890,6 +893,16 @@ internal sealed class SceneDiscoveryService
                     ["w"] = BitConverter.ToSingle(data, offset + 28),
                 },
             };
+
+            if (recordSize >= 48)
+            {
+                transform.Scale = new Dictionary<string, float>
+                {
+                    ["x"] = BitConverter.ToSingle(data, offset + 32),
+                    ["y"] = BitConverter.ToSingle(data, offset + 36),
+                    ["z"] = BitConverter.ToSingle(data, offset + 40),
+                };
+            }
 
             placements.Add(new LbaPlacement(index, transform));
         }

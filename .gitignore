@@ -43,6 +43,8 @@ tools/FmdlGltfConverter/bin/
 tools/Fox2SceneConverter/bin/
 !tools/SceneGltfComposer/SceneGltfComposer.csproj
 tools/SceneGltfComposer/bin/
+!tools/FoxScenePackager/FoxScenePackager.csproj
+tools/FoxScenePackager/bin/
 
 ###
 # OS generated
